@@ -91,6 +91,26 @@ int klee_enter_ptrace(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_prctl(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_seccomp(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_inotify_add_watch(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_utimensat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_utimes(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_futimesat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_xattr_write(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_lxattr_write(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_xattr_read(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_lxattr_read(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_statfs(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_fchmodat2(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_fanotify_mark(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_name_to_handle_at(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_open_tree(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_pid_arg0(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_kcmp(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_perf_event_open(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_prio(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_ioprio(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_clone(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_clone3(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_unshare(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_io_uring_setup(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 
 #endif /* KLEE_ENTER_H */

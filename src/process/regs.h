@@ -26,9 +26,14 @@ void klee_regs_restore_original(KleeProcess *proc);
 int klee_regs_get_sysnum(const KleeProcess *proc);
 void klee_regs_set_sysnum(KleeProcess *proc, int sysnum);
 
-/* Get/set syscall arguments (0-5) */
+/* Get/set syscall arguments (0-5) in the tracee's ABI.  Honours the
+ * socketcall/ipc demultiplexing state: for a socketcall the arguments are
+ * the entries of its array, for ipc they are shifted by one register. */
 uint64_t klee_regs_get_arg(const KleeProcess *proc, int n);
 void klee_regs_set_arg(KleeProcess *proc, int n, uint64_t value);
+/* Set the register that carries argument n of the syscall actually being
+ * executed, ignoring any demultiplexing. */
+void klee_regs_set_arg_raw(KleeProcess *proc, int n, uint64_t value);
 
 /* Get/set syscall return value */
 long klee_regs_get_result(const KleeProcess *proc);

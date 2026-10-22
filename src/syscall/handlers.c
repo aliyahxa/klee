@@ -144,6 +144,53 @@ int klee_get_intercepted_syscalls(int *out, size_t max_count)
 #ifdef KLEE_SYS_pidfd_open
         KLEE_SYS_pidfd_open,
 #endif
+
+        /* Path-taking syscalls that used to reach the host filesystem
+         * untranslated (timestamps, xattrs, statfs, mount-id lookups). */
+        KLEE_SYS_utimensat,
+        KLEE_SYS_utimes,
+        KLEE_SYS_utime,
+        KLEE_SYS_futimesat,
+        KLEE_SYS_setxattr,
+        KLEE_SYS_lsetxattr,
+        KLEE_SYS_getxattr,
+        KLEE_SYS_lgetxattr,
+        KLEE_SYS_listxattr,
+        KLEE_SYS_llistxattr,
+        KLEE_SYS_removexattr,
+        KLEE_SYS_lremovexattr,
+        KLEE_SYS_statfs,
+        KLEE_SYS_fchmodat2,
+        KLEE_SYS_fanotify_mark,
+        KLEE_SYS_name_to_handle_at,
+        KLEE_SYS_open_tree,
+
+        /* PID-targeting syscalls: translate the pid and keep host
+         * processes out of reach. */
+        KLEE_SYS_sched_setaffinity,
+        KLEE_SYS_sched_getaffinity,
+        KLEE_SYS_sched_setscheduler,
+        KLEE_SYS_sched_getscheduler,
+        KLEE_SYS_sched_setparam,
+        KLEE_SYS_sched_getparam,
+        KLEE_SYS_sched_rr_get_interval,
+        KLEE_SYS_sched_setattr,
+        KLEE_SYS_sched_getattr,
+        KLEE_SYS_prlimit64,
+        KLEE_SYS_process_vm_readv,
+        KLEE_SYS_process_vm_writev,
+        KLEE_SYS_get_robust_list,
+        KLEE_SYS_move_pages,
+        KLEE_SYS_migrate_pages,
+        KLEE_SYS_kcmp,
+        KLEE_SYS_perf_event_open,
+        KLEE_SYS_setpriority,
+        KLEE_SYS_getpriority,
+        KLEE_SYS_ioprio_set,
+        KLEE_SYS_ioprio_get,
+
+        /* What threads share: unshare() splits cwd/fd tables again */
+        KLEE_SYS_unshare,
     };
 
     size_t count = sizeof(syscalls) / sizeof(syscalls[0]);

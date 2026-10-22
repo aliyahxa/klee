@@ -9,7 +9,7 @@
 #include <stddef.h>
 
 /* Maximum number of syscalls we intercept */
-#define KLEE_MAX_INTERCEPTED_SYSCALLS 128
+#define KLEE_MAX_INTERCEPTED_SYSCALLS 256
 
 typedef struct {
     struct sock_filter *filter;

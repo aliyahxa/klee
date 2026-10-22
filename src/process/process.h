@@ -14,6 +14,7 @@
 #include "util/arena.h"
 #include "util/hash_table.h"
 #include "fs/fd_table.h"
+#include "intercept/intercept.h"
 
 /* Forward declarations */
 typedef struct klee_mount_table KleeMountTable;
@@ -60,6 +61,13 @@ typedef struct klee_sandbox {
     int ref_count;
 } KleeSandbox;
 
+/* What CLONE_FS shares between threads: the virtual working directory.
+ * A chdir() by one thread must be seen by the others, as in the kernel. */
+typedef struct klee_fs_state {
+    char cwd[PATH_MAX];
+    int refs;
+} KleeFsState;
+
 typedef struct klee_process {
     pid_t real_pid;
     pid_t virtual_pid;
@@ -68,9 +76,11 @@ typedef struct klee_process {
     ProcessState state;
     struct user_regs_struct regs[REG_SLOTS];
 
-    KleeFdTable *fd_table;
-    char vcwd[PATH_MAX];
+    KleeFdTable *fd_table;      /* shared with CLONE_FILES siblings */
+    KleeFsState *fs;            /* shared with CLONE_FS siblings */
+    char *vcwd;                 /* == fs->cwd */
     char vexe[PATH_MAX];
+    unsigned long pending_clone_flags; /* flags of the clone() in flight */
 
     KleeIdState *id_state;
     KleeSandbox *sandbox;
@@ -88,6 +98,15 @@ typedef struct klee_process {
 
     /* Current syscall info */
     int current_syscall;
+    KleeAbi abi;                /* ABI of the syscall being handled */
+    int raw_nr;                 /* number as the tracee issued it */
+    unsigned sys32_flags;       /* KLEE_SYS32_* for an i386 syscall */
+    int arg_shift;              /* ipc(2): canonical arg n is register n+1 */
+    bool demux_mem;             /* socketcall(2): canonical args live in memory */
+    bool demux_dirty;           /* a handler changed a demultiplexed arg */
+    int demux_nargs;
+    uint64_t demux_args[6];
+    uint64_t demux_saved_ptr;   /* socketcall's original argument pointer */
     int deny_errno;             /* non-zero when syscall was denied on enter */
     bool seccomp_entered;       /* waiting for extra enter-stop after SECCOMP event */
     bool suppress_initial_stop; /* suppress first SIGSTOP after fork (ptrace artifact) */
@@ -124,9 +143,15 @@ KleeProcess *klee_process_find(KleeProcessTable *pt, pid_t real_pid);
 /* Remove and free process */
 void klee_process_remove(KleeProcessTable *pt, pid_t real_pid);
 
-/* Clone process state for fork/clone */
+/* Clone process state for fork/clone.  clone_flags decides what the new
+ * task shares with its creator (CLONE_FILES, CLONE_FS) and what it gets
+ * copies of. */
 KleeProcess *klee_process_fork(KleeProcessTable *pt, KleeProcess *parent,
-                                pid_t child_real_pid);
+                                pid_t child_real_pid,
+                                unsigned long clone_flags);
+
+/* unshare(2): give the process private copies of what the flags name */
+void klee_process_unshare(KleeProcess *proc, unsigned long flags);
 
 /* Handle exec: clear cloexec FDs, update vexe */
 void klee_process_exec(KleeProcess *proc, const char *new_exe);

@@ -16,12 +16,22 @@ static inline int fd_hash(int fd)
 KleeFdTable *klee_fd_table_create(void)
 {
     KleeFdTable *ft = calloc(1, sizeof(KleeFdTable));
+    ft->refs = 1;
+    return ft;
+}
+
+KleeFdTable *klee_fd_table_ref(KleeFdTable *ft)
+{
+    if (ft)
+        ft->refs++;
     return ft;
 }
 
 void klee_fd_table_destroy(KleeFdTable *ft)
 {
     if (!ft)
+        return;
+    if (--ft->refs > 0)
         return;
 
     for (int i = 0; i < KLEE_FD_TABLE_BUCKETS; i++) {

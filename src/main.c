@@ -11,6 +11,7 @@
 #include "process/event.h"
 #include "process/memory.h"
 #include "syscall/dispatch.h"
+#include "syscall/exec_shim.h"
 #include "fs/mount_table.h"
 #include "fs/tmpfs.h"
 #include "ns/pid_ns.h"
@@ -646,6 +647,7 @@ int main(int argc, char **argv)
     interceptor->destroy(interceptor);
     klee_proc_synth_cleanup();
     klee_tmpfs_cleanup();
+    klee_exec_shim_cleanup();
     klee_log_close_file();
     klee_config_destroy(&cfg);
     return exit_status;
@@ -669,6 +671,7 @@ cleanup:
         interceptor->destroy(interceptor);
     klee_proc_synth_cleanup();
     klee_tmpfs_cleanup();
+    klee_exec_shim_cleanup();
     klee_log_close_file();
     klee_config_destroy(&cfg);
     return 1;

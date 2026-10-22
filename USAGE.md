@@ -186,9 +186,12 @@ These affect the next mount operation only:
 
 ## Environment Variables
 
-| Variable    | Values                                       | Description              |
-|-------------|----------------------------------------------|--------------------------|
-| `KLEE_LOG`  | `error`, `warn`, `info`, `debug`, `trace`    | Set log verbosity level  |
+| Variable                 | Values                                    | Description                                                        |
+|--------------------------|-------------------------------------------|--------------------------------------------------------------------|
+| `KLEE_LOG`               | `error`, `warn`, `info`, `debug`, `trace` | Set log verbosity level                                            |
+| `KLEE_EXEC_SHIM`         | `0`                                       | Never stage copies of sandbox binaries; start them through `ld.so` |
+| `KLEE_EXEC_DIR`          | directory                                 | Where staged copies live (default `$TMPDIR`, `/tmp`, `/var/tmp`)   |
+| `KLEE_EXEC_COPY_MAX_MB`  | number                                    | Binaries larger than this run through `ld.so` (default 512, 0 = none) |
 
 Default log level is `warn`. Set `KLEE_LOG=debug` for detailed operation
 tracing, or `KLEE_LOG=trace` for full syscall-level output.
@@ -249,13 +252,76 @@ paths to host paths. When a syscall references a path:
    used directly for the syscall (seccomp_unotify)
 
 Read-only mounts are enforced by checking write-mode syscalls against
-the mount table and returning `-EROFS`.
+the mount table and returning `-EROFS`, following the kernel's own rules
+for a real `MS_RDONLY` mount: device nodes, fifos and sockets stay
+writable (so `--ro-bind / /` still allows writing to `/dev/null`), an
+existing file may be reopened with `O_CREAT`, and a missing file gets
+`ENOENT` rather than `EROFS`.
+
+### Program Loading
+
+The kernel resolves two things on the host filesystem, bypassing the
+mount table: the interpreter of a `#!` script and the `PT_INTERP` of a
+dynamic ELF binary (`/lib64/ld-linux-x86-64.so.2`). When the sandbox maps
+a different file at that path -- every Conty or Steam-runtime style
+rootfs does -- the host's loader would be paired with the sandbox's
+libraries.
+
+Klee handles this without changing how the process looks:
+
+1. The binary is copied once per session into a private directory, with
+   its `PT_INTERP` string rewritten to a short symlink
+   (`/tmp/kl-XXXXXX/0`) that points at the sandbox's loader. The kernel
+   loads that loader itself.
+2. The copy is executed through a path whose last component is the name
+   the program was called by, so `comm` is right (`sleep`, or the script's
+   own name for a script). `argv`, the environment and the auxiliary
+   vector are passed through untouched, so `ps`, `pgrep`, `pidof`,
+   `killall` and the program's own `argv[0]` all see the real program.
+3. `/proc/<pid>/exe` and `readlink` on it report the guest path.
+
+Copies are keyed by device, inode, size and timestamps, live under
+`KLEE_EXEC_DIR` (or `$TMPDIR`, `/tmp`, `/var/tmp`; the directory must
+allow `exec`) and are removed when klee exits. A session that dies
+without cleaning up (SIGKILL, `docker stop`) leaves its directories
+behind until the next klee start, which reclaims any session directory
+whose lock is no longer held.
+
+If a copy cannot be made (`KLEE_EXEC_SHIM=0`, no usable directory, not
+enough space, binary above `KLEE_EXEC_COPY_MAX_MB`), klee falls back to
+executing the sandbox's `ld.so` with the program as its first argument.
+`comm` is still correct in that mode, but `/proc/<pid>/cmdline` shows the
+loader and the program receives its resolved path as `argv[0]`.
+
+### 32-bit Programs
+
+A 32-bit program (the Steam client, 32-bit games and Wine) uses the i386
+syscall table and registers. klee's seccomp filter traps both ABIs, the
+backend decodes each stop in the ABI it was taken in and maps i386
+numbers onto the x86_64 handlers, `socketcall(2)` and `ipc(2)` are split
+into the calls they carry, and handlers that read or write user structures
+(`stat64`, `msghdr`, `sock_fprog`, argv pointers) use the 32-bit layouts.
+x32 is not supported.
+
+### Threads
+
+Clones created with `CLONE_FS` and `CLONE_FILES` share the virtual working
+directory and fd table with their creator, as in the kernel, so a `chdir()`
+in one thread is seen by the others and a directory fd opened by one thread
+works in another; `unshare(2)` splits them again.
 
 ### Namespace Simulation
 
-- **PID namespace**: Bidirectional hash map translates between real and
-  virtual PIDs. `getpid()` returns the virtual PID; `kill()` translates
-  virtual PIDs to real ones before forwarding.
+- **PID namespace**: the first process is PID 1 and its parent reads as
+  0; every other process keeps its host PID number. That keeps the ids the
+  kernel writes where klee cannot intervene (`fork()` return values,
+  `CLONE_CHILD_SETTID`, `SIGCHLD` and `SO_PEERCRED`, the thread ids glibc
+  uses for PI and robust futexes) consistent with what `getpid()` and
+  `gettid()` report. Containment is done by lookup: `kill`, `tgkill`,
+  `pidfd_open`, `sched_*`, `setpriority`, `prlimit`, `process_vm_*`,
+  `kcmp` and friends fail with `ESRCH` for host PIDs, `/proc/<pid>` of a
+  host process is `ENOENT`, `kill(-1)` reaches only the sandbox, and
+  `si_pid` shows 1 for init and 0 for a sender outside the sandbox.
 
 - **User namespace**: Per-process UID/GID state tracks
   real/effective/saved/fs IDs. `setuid()` family updates internal state
@@ -343,6 +409,10 @@ klee --ro-bind / / --tmpfs /tmp -- /bin/touch /tmp/test
 # The shell sees itself as PID 1
 klee --bind / / --unshare-pid -- /bin/bash -c 'echo $$'
 # Output: 1
+
+# Its children keep their host PID numbers, consistently everywhere
+klee --bind / / --unshare-pid -- /bin/sh -c 'sleep 1 & echo $!; wait'
+# Output: e.g. 48213 (and kill 48213 from inside works; a host PID is ESRCH)
 ```
 
 ### UID Simulation
@@ -424,11 +494,25 @@ diff <(bwrap --bind / / -- /usr/bin/id) \
 
 - **Overlay mounts** (`--overlay`, `--tmp-overlay`, `--ro-overlay`) are
   not yet fully implemented (logged as warnings).
-- **FUSE /proc overlay** provides basic passthrough; some synthetic
-  files (e.g., `/proc/self/maps` path rewriting) are incomplete.
+- **ptrace inside the sandbox** is not available: klee is already the
+  tracer, so `strace`, `gdb`, crash handlers that attach to their own
+  process, and `winedbg` get `EPERM` from `PTRACE_TRACEME`/`ATTACH`.
+- **`--unshare-net` does not isolate anything** without a real network
+  namespace: loopback and abstract Unix sockets of the host stay
+  reachable. slirp4netns, when present, only adds connectivity.
+- **`/proc` without FUSE**: `/proc/self/mountinfo` is the host's, and
+  `/proc/<pid>/fd/*`, `cwd` and `maps` resolve to host paths. The FUSE
+  overlay fixes most of this but needs a mount, which an unprivileged
+  container usually cannot do.
+- **Capabilities are not virtualized**: a sandboxed process keeps the
+  capabilities klee itself has. Run klee as the unprivileged user whose
+  rights the sandbox should have.
 - **io_uring** is blocked (`-ENOSYS`) because it bypasses both seccomp
   and ptrace interception.
 - **Nested bwrap/klee** invocations are detected but not fully layered.
+- **Directory listings** do not synthesize mount points that have no
+  directory in the underlying rootfs (`ls /` after `--bind rootfs /
+  --ro-bind /usr /usr` does not show `usr` unless `rootfs/usr` exists).
 - The ptrace backend has higher overhead than seccomp_unotify due to
   context switches per syscall.
 

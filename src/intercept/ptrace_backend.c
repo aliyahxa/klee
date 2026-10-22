@@ -3,6 +3,7 @@
  * ptrace fallback backend implementation
  */
 #include "ptrace_backend.h"
+#include "syscall/sysnum32.h"
 #include "util/log.h"
 
 #include <stdlib.h>
@@ -25,6 +26,39 @@
 #ifndef PTRACE_O_TRACESECCOMP
 #define PTRACE_O_TRACESECCOMP (1 << PTRACE_EVENT_SECCOMP)
 #endif
+
+/* Code segment selector of a tracee running 32-bit code (__USER32_CS).
+ * It tells a compat syscall (i386 numbers, ebx/ecx/... arguments) from a
+ * native one; the same check strace uses. */
+#define USER32_CS 0x23
+
+/* Decode the syscall number and arguments at a syscall stop.  Arguments
+ * of a 32-bit tracee are the low halves of the registers; its number is
+ * mapped onto the x86_64 one klee's handlers are registered under. */
+static void decode_syscall_regs(const struct user_regs_struct *r, KleeEvent *out)
+{
+    out->raw_nr = (int)r->orig_rax;
+    if (r->cs == USER32_CS) {
+        out->abi = KLEE_ABI_I386;
+        out->syscall_nr = klee_sysnum_i386_to_x64(out->raw_nr, &out->abi_flags);
+        out->args[0] = (uint32_t)r->rbx;
+        out->args[1] = (uint32_t)r->rcx;
+        out->args[2] = (uint32_t)r->rdx;
+        out->args[3] = (uint32_t)r->rsi;
+        out->args[4] = (uint32_t)r->rdi;
+        out->args[5] = (uint32_t)r->rbp;
+    } else {
+        out->abi = KLEE_ABI_X86_64;
+        out->abi_flags = 0;
+        out->syscall_nr = out->raw_nr;
+        out->args[0] = r->rdi;
+        out->args[1] = r->rsi;
+        out->args[2] = r->rdx;
+        out->args[3] = r->r10;
+        out->args[4] = r->r8;
+        out->args[5] = r->r9;
+    }
+}
 
 #define PTRACE_OPTIONS (PTRACE_O_TRACESYSGOOD | \
                         PTRACE_O_TRACEFORK    | \
@@ -157,19 +191,15 @@ static int ptrace_wait_event(KleeInterceptor *self, KleeEvent *out)
 
     /* Syscall stop: SIGTRAP | 0x80 */
     if (sig == (SIGTRAP | 0x80)) {
-        /* Read registers to determine syscall number and args */
+        /* Read registers to determine syscall number and args.
+         * PTRACE_GETREGS always fills the 64-bit user_regs_struct, also
+         * for a 32-bit tracee (GETREGSET would hand back the 68-byte i386
+         * layout instead). */
         struct user_regs_struct regs;
-        struct iovec iov = { &regs, sizeof(regs) };
-        if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0)
+        if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) < 0)
             return -errno;
 
-        out->syscall_nr = (int)regs.orig_rax;
-        out->args[0] = regs.rdi;
-        out->args[1] = regs.rsi;
-        out->args[2] = regs.rdx;
-        out->args[3] = regs.r10;
-        out->args[4] = regs.r8;
-        out->args[5] = regs.r9;
+        decode_syscall_regs(&regs, out);
 
         /* Determine if this is enter or exit by checking rax.
          * On enter, rax == -ENOSYS. On exit, rax has the return value. */
@@ -219,17 +249,10 @@ static int ptrace_wait_event(KleeInterceptor *self, KleeEvent *out)
         /* Seccomp pre-filter fired SECCOMP_RET_TRACE — this is a
          * syscall-enter stop for a syscall klee needs to intercept. */
         struct user_regs_struct seccomp_regs;
-        struct iovec seccomp_iov = { &seccomp_regs, sizeof(seccomp_regs) };
-        if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &seccomp_iov) < 0)
+        if (ptrace(PTRACE_GETREGS, pid, NULL, &seccomp_regs) < 0)
             return -errno;
         out->type = KLEE_EVENT_SYSCALL_ENTER;
-        out->syscall_nr = (int)seccomp_regs.orig_rax;
-        out->args[0] = seccomp_regs.rdi;
-        out->args[1] = seccomp_regs.rsi;
-        out->args[2] = seccomp_regs.rdx;
-        out->args[3] = seccomp_regs.r10;
-        out->args[4] = seccomp_regs.r8;
-        out->args[5] = seccomp_regs.r9;
+        decode_syscall_regs(&seccomp_regs, out);
         break;
     }
     default:
@@ -270,17 +293,15 @@ static int ptrace_skip_syscall(KleeInterceptor *self, pid_t pid, long retval)
     (void)self;
     (void)retval;
     struct user_regs_struct regs;
-    struct iovec iov = { &regs, sizeof(regs) };
 
-    if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0)
+    if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) < 0)
         return -errno;
 
     /* Replace with invalid syscall -1 so kernel returns ENOSYS.
      * The event loop overrides the return value at syscall-exit. */
     regs.orig_rax = -1;
 
-    iov.iov_len = sizeof(regs);
-    if (ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov) < 0)
+    if (ptrace(PTRACE_SETREGS, pid, NULL, &regs) < 0)
         return -errno;
 
     return 0;

@@ -74,6 +74,35 @@
 #define KLEE_SYS_open_by_handle_at SYS_open_by_handle_at
 #endif
 
+/* Timestamps, extended attributes, statfs, mount-id lookups */
+#define KLEE_SYS_utimensat       SYS_utimensat
+#define KLEE_SYS_utimes          SYS_utimes
+#define KLEE_SYS_utime           SYS_utime
+#define KLEE_SYS_futimesat       SYS_futimesat
+#define KLEE_SYS_setxattr        SYS_setxattr
+#define KLEE_SYS_lsetxattr       SYS_lsetxattr
+#define KLEE_SYS_getxattr        SYS_getxattr
+#define KLEE_SYS_lgetxattr       SYS_lgetxattr
+#define KLEE_SYS_listxattr       SYS_listxattr
+#define KLEE_SYS_llistxattr      SYS_llistxattr
+#define KLEE_SYS_removexattr     SYS_removexattr
+#define KLEE_SYS_lremovexattr    SYS_lremovexattr
+#define KLEE_SYS_statfs          SYS_statfs
+#define KLEE_SYS_fanotify_mark   SYS_fanotify_mark
+#ifdef SYS_fchmodat2
+#define KLEE_SYS_fchmodat2       SYS_fchmodat2
+#else
+#define KLEE_SYS_fchmodat2       452
+#endif
+#ifdef SYS_open_tree
+#define KLEE_SYS_open_tree       SYS_open_tree
+#else
+#define KLEE_SYS_open_tree       428
+#endif
+#ifndef KLEE_SYS_name_to_handle_at
+#define KLEE_SYS_name_to_handle_at 303
+#endif
+
 /* /proc-related */
 #define KLEE_SYS_getdents        SYS_getdents
 
@@ -95,6 +124,28 @@
 #ifdef SYS_pidfd_open
 #define KLEE_SYS_pidfd_open      SYS_pidfd_open
 #endif
+/* PID-targeting syscalls (scheduling, priorities, limits, memory) */
+#define KLEE_SYS_sched_setaffinity   SYS_sched_setaffinity
+#define KLEE_SYS_sched_getaffinity   SYS_sched_getaffinity
+#define KLEE_SYS_sched_setscheduler  SYS_sched_setscheduler
+#define KLEE_SYS_sched_getscheduler  SYS_sched_getscheduler
+#define KLEE_SYS_sched_setparam      SYS_sched_setparam
+#define KLEE_SYS_sched_getparam      SYS_sched_getparam
+#define KLEE_SYS_sched_rr_get_interval SYS_sched_rr_get_interval
+#define KLEE_SYS_sched_setattr       SYS_sched_setattr
+#define KLEE_SYS_sched_getattr       SYS_sched_getattr
+#define KLEE_SYS_prlimit64           SYS_prlimit64
+#define KLEE_SYS_process_vm_readv    SYS_process_vm_readv
+#define KLEE_SYS_process_vm_writev   SYS_process_vm_writev
+#define KLEE_SYS_get_robust_list     SYS_get_robust_list
+#define KLEE_SYS_move_pages          SYS_move_pages
+#define KLEE_SYS_migrate_pages       SYS_migrate_pages
+#define KLEE_SYS_kcmp                SYS_kcmp
+#define KLEE_SYS_perf_event_open     SYS_perf_event_open
+#define KLEE_SYS_setpriority         SYS_setpriority
+#define KLEE_SYS_getpriority         SYS_getpriority
+#define KLEE_SYS_ioprio_set          SYS_ioprio_set
+#define KLEE_SYS_ioprio_get          SYS_ioprio_get
 #define KLEE_SYS_setpgid         SYS_setpgid
 #define KLEE_SYS_getpgid         SYS_getpgid
 #define KLEE_SYS_getpgrp         SYS_getpgrp
@@ -102,6 +153,7 @@
 #define KLEE_SYS_getsid          SYS_getsid
 #define KLEE_SYS_wait4           SYS_wait4
 #define KLEE_SYS_waitid          SYS_waitid
+#define KLEE_SYS_unshare         SYS_unshare
 #define KLEE_SYS_exit            SYS_exit
 #define KLEE_SYS_exit_group      SYS_exit_group
 
@@ -158,7 +210,7 @@
 #endif
 
 /* Total number of syscalls we intercept */
-#define KLEE_INTERCEPTED_SYSCALL_COUNT 90
+#define KLEE_INTERCEPTED_SYSCALL_COUNT 256
 
 /* Get the list of all syscall numbers to intercept */
 int klee_get_intercepted_syscalls(int *out, size_t max_count);

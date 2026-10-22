@@ -15,6 +15,15 @@ typedef enum {
     INTERCEPT_PTRACE,
 } InterceptBackend;
 
+/* Syscall ABI a stop was taken in.  A 64-bit klee traces 32-bit programs
+ * too (the Steam client, 32-bit games): they use the i386 syscall table
+ * and registers.  The backend maps their numbers onto the x86_64 ones the
+ * dispatch table is keyed by and decodes arguments accordingly. */
+typedef enum {
+    KLEE_ABI_X86_64 = 0,
+    KLEE_ABI_I386   = 1,
+} KleeAbi;
+
 typedef enum {
     KLEE_EVENT_SYSCALL_ENTER,
     KLEE_EVENT_SYSCALL_EXIT,
@@ -28,7 +37,10 @@ typedef enum {
 typedef struct {
     KleeEventType type;
     pid_t pid;
-    int syscall_nr;
+    int syscall_nr;        /* x86_64 number (what handlers are keyed by), -1 if none */
+    KleeAbi abi;
+    int raw_nr;            /* number as the tracee issued it */
+    unsigned abi_flags;    /* KLEE_SYS32_* for i386 syscalls */
     uint64_t args[6];
     long retval;
     int signal;

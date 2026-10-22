@@ -20,13 +20,17 @@ typedef struct klee_fd_entry {
 typedef struct klee_fd_table {
     KleeFdEntry *buckets[KLEE_FD_TABLE_BUCKETS];
     int count;
+    int refs;   /* threads created with CLONE_FILES share one table */
 } KleeFdTable;
 
 /* Create empty FD table */
 KleeFdTable *klee_fd_table_create(void);
 
-/* Destroy FD table */
+/* Drop a reference; the table is freed with the last one */
 void klee_fd_table_destroy(KleeFdTable *ft);
+
+/* Take another reference (CLONE_FILES) */
+KleeFdTable *klee_fd_table_ref(KleeFdTable *ft);
 
 /* Clone FD table (for fork) */
 KleeFdTable *klee_fd_table_clone(const KleeFdTable *ft);

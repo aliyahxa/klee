@@ -8,7 +8,9 @@
  * through to the child's original filter for everything else.
  */
 #include "compat/seccomp_filter.h"
+#include "syscall/abi.h"
 #include "syscall/sysnum.h"
+#include "syscall/sysnum32.h"
 #include "util/log.h"
 
 #include <stdlib.h>
@@ -41,7 +43,7 @@
 static struct sock_fprog *rewrite_child_filter(const struct sock_filter *orig_insns,
                                                 unsigned short orig_len)
 {
-    /* Get the list of intercepted syscalls */
+    /* Get the list of intercepted syscalls, for both ABIs */
     int syscalls[KLEE_INTERCEPTED_SYSCALL_COUNT];
     int count = klee_get_intercepted_syscalls(syscalls,
                                                KLEE_INTERCEPTED_SYSCALL_COUNT);
@@ -49,16 +51,32 @@ static struct sock_fprog *rewrite_child_filter(const struct sock_filter *orig_in
         KLEE_WARN("seccomp rewrite: no intercepted syscalls");
         return NULL;
     }
+    int syscalls32[KLEE_INTERCEPTED_SYSCALL_COUNT * 2];
+    size_t count32 = 0;
+    for (int i = 0; i < count; i++)
+        count32 += klee_sysnum_x64_to_i386(syscalls[i], syscalls32 + count32,
+                                           sizeof(syscalls32) / sizeof(int) - count32);
+    if (count32 + 2 <= sizeof(syscalls32) / sizeof(int)) {
+        syscalls32[count32++] = KLEE_SYS32_socketcall;
+        syscalls32[count32++] = KLEE_SYS32_ipc;
+    }
+    if (count > 250 || count32 > 250) {
+        KLEE_WARN("seccomp rewrite: too many intercepted syscalls");
+        return NULL;
+    }
 
     /*
-     * Prefix layout:
-     *   [0]       LD syscall_nr
-     *   [1..cnt]  JEQ syscall_i, goto ret_trace, next
-     *   [cnt+1]   JA to child filter (skip over RET_TRACE)
-     *   [cnt+2]   RET SECCOMP_RET_TRACE
-     *   [cnt+3..] child's original filter
+     * Prefix layout (one block per ABI, each ending in its own RET_TRACE
+     * so every jump stays within the 8-bit range):
+     *   [0]        LD arch
+     *   [1]        JEQ AUDIT_ARCH_I386 -> i386 block
+     *   x86_64:    LD nr; JEQ syscall_i -> ret_trace ...; JA child; RET TRACE
+     *   i386:      LD nr; JEQ syscall_i -> ret_trace ...; JA child; RET TRACE
+     *   child's original filter
      */
-    size_t prefix_len = 1 + (size_t)count + 2; /* load + compares + jump + ret_trace */
+    size_t block64 = 1 + (size_t)count + 2;
+    size_t block32 = 1 + count32 + 2;
+    size_t prefix_len = 2 + block64 + block32;
     size_t total_len = prefix_len + orig_len;
 
     if (total_len > 4096) { /* BPF_MAXINSNS */
@@ -72,51 +90,66 @@ static struct sock_fprog *rewrite_child_filter(const struct sock_filter *orig_in
         return NULL;
 
     size_t n = 0;
-
-    /* Load syscall number */
     combined[n++] = BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
-                              offsetof(struct seccomp_data, nr));
+                              offsetof(struct seccomp_data, arch));
+    combined[n++] = BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_I386,
+                              (uint8_t)block64, 0);
 
-    /* For each intercepted syscall: jump to RET_TRACE on match */
-    size_t ret_trace_idx = 1 + (size_t)count + 1; /* index of RET_TRACE instruction */
-    for (int i = 0; i < count; i++) {
-        size_t cur_idx = n;
-        uint8_t jt = (uint8_t)(ret_trace_idx - cur_idx - 1);
-        combined[n++] = BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
-                                  (uint32_t)syscalls[i], jt, 0);
+    const int *lists[2] = { syscalls, syscalls32 };
+    size_t counts[2] = { (size_t)count, count32 };
+    for (int b = 0; b < 2; b++) {
+        combined[n++] = BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                                  offsetof(struct seccomp_data, nr));
+        for (size_t i = 0; i < counts[b]; i++) {
+            size_t remaining = counts[b] - i - 1;
+            combined[n++] = BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                                      (uint32_t)lists[b][i],
+                                      (uint8_t)(remaining + 1), 0);
+        }
+        /* No match: jump over this block's RET_TRACE (and the other
+         * block, if any) to the child's filter. */
+        size_t to_child = prefix_len - (n + 1);
+        if (to_child > 255) {
+            KLEE_WARN("seccomp rewrite: prefix too long");
+            free(combined);
+            return NULL;
+        }
+        combined[n++] = BPF_JUMP(BPF_JMP | BPF_JA, (uint32_t)to_child, 0, 0);
+        combined[n++] = BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE);
     }
 
-    /* Jump over RET_TRACE to child's filter */
-    combined[n++] = BPF_STMT(BPF_JMP | BPF_JA, 1);
-
-    /* RET_TRACE */
-    combined[n++] = BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE);
-
-    /* Append child's original filter */
-    memcpy(combined + n, orig_insns, orig_len * sizeof(struct sock_filter));
+    /* Append child's original filter unchanged */
+    memcpy(&combined[n], orig_insns, orig_len * sizeof(struct sock_filter));
+    n += orig_len;
 
     struct sock_fprog *result = calloc(1, sizeof(struct sock_fprog));
     if (!result) {
         free(combined);
         return NULL;
     }
-    result->len = (unsigned short)total_len;
+    result->len = (unsigned short)n;
     result->filter = combined;
 
-    KLEE_DEBUG("seccomp rewrite: prepended %zu instructions before %d child instructions",
-               prefix_len, orig_len);
+    KLEE_DEBUG("seccomp rewrite: prefix=%zu + orig=%d = %zu instructions",
+               prefix_len, orig_len, n);
     return result;
 }
 
 int klee_compat_handle_seccomp_filter(KleeInterceptor *ic, pid_t pid,
-                                       struct sock_fprog *fprog_local,
-                                       void *fprog_remote,
+                                       KleeAbi abi, uint16_t fprog_len,
+                                       uint64_t fprog_filter,
+                                       uint64_t fprog_remote,
                                        uint64_t tracee_rsp)
 {
-    if (!fprog_local || !fprog_local->filter || fprog_local->len == 0) {
+    if (!fprog_filter || fprog_len == 0) {
         KLEE_WARN("child seccomp filter: empty program");
         return 0;
     }
+    struct sock_fprog fprog_storage = {
+        .len = fprog_len,
+        .filter = (struct sock_filter *)(uintptr_t)fprog_filter,
+    };
+    struct sock_fprog *fprog_local = &fprog_storage;
 
     KLEE_DEBUG("child seccomp filter: %d instructions from pid %d",
                fprog_local->len, pid);
@@ -179,15 +212,13 @@ int klee_compat_handle_seccomp_filter(KleeInterceptor *ic, pid_t pid,
 
         /* Update the tracee's sock_fprog: new length and new filter pointer.
          * fprog_remote is the tracee-side address of the sock_fprog struct. */
-        struct sock_fprog new_fprog;
-        new_fprog.len = rewritten->len;
-        new_fprog.filter = (struct sock_filter *)(uintptr_t)scratch;
-        rc = ic->write_mem(ic, pid, fprog_remote, &new_fprog, sizeof(new_fprog));
+        rc = klee_abi_write_fprog(ic, pid, abi, fprog_remote, rewritten->len,
+                                  scratch);
         if (rc < 0)
             KLEE_WARN("seccomp rewrite: failed to update fprog: %d", rc);
 
         KLEE_INFO("seccomp rewrite: successfully rewrote child filter for pid %d "
-                   "(%d -> %d instructions)", pid, fprog_local->len, new_fprog.len);
+                   "(%d -> %d instructions)", pid, fprog_local->len, rewritten->len);
         free(rewritten->filter);
         free(rewritten);
         return 0;

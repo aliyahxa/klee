@@ -29,13 +29,17 @@ TEST(first_is_pid1)
 
 TEST(sequential_assignment)
 {
+    /* init is 1; everyone else keeps the host number (see pid_ns.c) */
     KleePidMap *pm = klee_pid_map_create();
     pid_t v1 = klee_pid_map_add(pm, 100);
     pid_t v2 = klee_pid_map_add(pm, 200);
     pid_t v3 = klee_pid_map_add(pm, 300);
     assert(v1 == 1);
-    assert(v2 == 2);
-    assert(v3 == 3);
+    assert(v2 == 200);
+    assert(v3 == 300);
+    assert(klee_pid_map_v2r(pm, 1) == 100);
+    assert(klee_pid_map_v2r(pm, 200) == 200);
+    assert(klee_pid_map_r2v(pm, 100) == 1);
     assert(klee_pid_map_count(pm) == 3);
     klee_pid_map_destroy(pm);
 }
@@ -43,13 +47,14 @@ TEST(sequential_assignment)
 TEST(bidirectional_lookup)
 {
     KleePidMap *pm = klee_pid_map_create();
-    klee_pid_map_add(pm, 100);  /* vpid 1 */
-    klee_pid_map_add(pm, 200);  /* vpid 2 */
+    klee_pid_map_add(pm, 100);  /* init: vpid 1 */
+    klee_pid_map_add(pm, 200);  /* keeps its number: vpid 200 */
 
     assert(klee_pid_map_r2v(pm, 100) == 1);
-    assert(klee_pid_map_r2v(pm, 200) == 2);
+    assert(klee_pid_map_r2v(pm, 200) == 200);
     assert(klee_pid_map_v2r(pm, 1) == 100);
-    assert(klee_pid_map_v2r(pm, 2) == 200);
+    assert(klee_pid_map_v2r(pm, 200) == 200);
+    assert(klee_pid_map_v2r(pm, 2) == 0);
     assert(klee_pid_map_r2v(pm, 999) == 0);
     assert(klee_pid_map_v2r(pm, 999) == 0);
     klee_pid_map_destroy(pm);
@@ -66,7 +71,7 @@ TEST(remove_process)
     assert(klee_pid_map_count(pm) == 1);
     assert(klee_pid_map_r2v(pm, 100) == 0);
     assert(klee_pid_map_v2r(pm, 1) == 0);
-    assert(klee_pid_map_r2v(pm, 200) == 2);
+    assert(klee_pid_map_r2v(pm, 200) == 200);
     klee_pid_map_destroy(pm);
 }
 

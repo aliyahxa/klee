@@ -4,6 +4,9 @@
  */
 #include "syscall/enter.h"
 #include "syscall/sysnum.h"
+#include "syscall/sysnum32.h"
+#include "syscall/abi.h"
+#include "syscall/exec_shim.h"
 #include "process/memory.h"
 #include "process/regs.h"
 #include "fs/path_resolve.h"
@@ -28,6 +31,8 @@
 #include <linux/openat2.h>
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
+#include <sched.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -44,6 +49,7 @@
 static int translate_path_arg_ex(KleeProcess *proc, KleeInterceptor *ic,
                                  KleeEvent *ev, int arg_idx, int dirfd_idx,
                                  bool nofollow);
+static pid_t resolve_target_pid(KleeProcess *proc, pid_t pid);
 
 static int translate_path_arg(KleeProcess *proc, KleeInterceptor *ic,
                                KleeEvent *ev, int arg_idx, int dirfd_idx)
@@ -135,6 +141,13 @@ static int translate_path_arg_ex(KleeProcess *proc, KleeInterceptor *ic,
                     snprintf(proc->saved_path, PATH_MAX, "%s", rewritten);
                     vpid_rewritten = true;
                     proc_rewrite_real_pid = real_pid;
+                } else if (real_pid <= 0 &&
+                           resolve_target_pid(proc, vpid_val) <= 0) {
+                    /* A host process: in a real PID namespace this
+                     * /proc entry does not exist. */
+                    KLEE_TRACE("/proc/%d: not in namespace -> ENOENT",
+                               vpid_val);
+                    return -ENOENT;
                 }
             }
         }
@@ -274,7 +287,8 @@ static int check_readonly_open(KleeProcess *proc, int flags)
         return 0;
 
     if (klee_readonly_check_open(proc->sandbox->mount_table,
-                                  proc->resolved_guest, flags))
+                                  proc->resolved_guest, proc->translated_path,
+                                  flags))
         return -EROFS;
     return 0;
 }
@@ -485,8 +499,6 @@ int klee_enter_readlinkat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
  * interpreter/loader, building the full argv chain in the tracee's stack.
  */
 
-#include <elf.h>
-
 /*
  * Parse a shebang line from a file buffer.
  * Returns the interpreter path in interp_out and optional arg in optarg_out.
@@ -537,45 +549,6 @@ static int parse_shebang(const char *buf, ssize_t len,
     return 0;
 }
 
-/*
- * Read PT_INTERP from an ELF file.
- * Returns 0 if found, -1 otherwise.
- */
-static int read_elf_interp(const char *host_path, char *interp_out, size_t size)
-{
-    int fd = open(host_path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return -1;
-
-    Elf64_Ehdr ehdr;
-    if (read(fd, &ehdr, sizeof(ehdr)) != (ssize_t)sizeof(ehdr) ||
-        memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 ||
-        ehdr.e_ident[EI_CLASS] != ELFCLASS64) {
-        close(fd);
-        return -1;
-    }
-
-    int found = -1;
-    for (int i = 0; i < ehdr.e_phnum; i++) {
-        Elf64_Phdr phdr;
-        if (pread(fd, &phdr, sizeof(phdr),
-                  (off_t)(ehdr.e_phoff + (uint64_t)i * ehdr.e_phentsize))
-            != (ssize_t)sizeof(phdr))
-            break;
-        if (phdr.p_type == PT_INTERP && phdr.p_filesz > 0 &&
-            phdr.p_filesz < size) {
-            ssize_t r = pread(fd, interp_out, phdr.p_filesz, (off_t)phdr.p_offset);
-            if (r == (ssize_t)phdr.p_filesz) {
-                interp_out[phdr.p_filesz] = '\0';
-                found = 0;
-            }
-            break;
-        }
-    }
-
-    close(fd);
-    return found;
-}
-
 /* True when both host paths name the same file.  If the kernel's own
  * PT_INTERP lookup would load the very loader the sandbox maps there, the
  * ld.so indirection buys nothing, and skipping it keeps comm, cmdline and
@@ -588,8 +561,31 @@ static bool same_host_file(const char *a, const char *b)
            sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
 }
 
+/* The kernel derives comm from the last component of the path handed to
+ * execve, before following symlinks: "sh" for /bin/sh even when that is
+ * dash, and a script's own name for a script.  Reproduce that from the raw
+ * path the tracee used, falling back to the file we actually run. */
+static void exec_comm_name(const char *raw_path, const char *host_path,
+                           char *out, size_t out_size)
+{
+    const char *candidates[2] = { raw_path, host_path };
+    for (int i = 0; i < 2; i++) {
+        const char *p = candidates[i];
+        if (!p || !*p)
+            continue;
+        const char *base = strrchr(p, '/');
+        base = base ? base + 1 : p;
+        if (*base && strcmp(base, ".") != 0 && strcmp(base, "..") != 0) {
+            snprintf(out, out_size, "%s", base);
+            return;
+        }
+    }
+    out[0] = '\0';
+}
+
+/* path_arg/argv_arg: 0/1 for execve, 1/2 for execveat. */
 static int handle_exec_interp(KleeProcess *proc, KleeInterceptor *ic,
-                                KleeEvent *ev)
+                                KleeEvent *ev, int path_arg, int argv_arg)
 {
     KleeResolveCtx ctx = {
         .mount_table = proc->sandbox->mount_table,
@@ -603,10 +599,9 @@ static int handle_exec_interp(KleeProcess *proc, KleeInterceptor *ic,
     char current_host[PATH_MAX];
     snprintf(current_host, sizeof(current_host), "%s", proc->translated_path);
 
-    /* If the target is /proc/<pid>/exe, resolve the symlink NOW.
-     * After exec, /proc/<pid>/exe will point to ld-linux (the new binary),
-     * making the original symlink useless.  ld-linux would try to load
-     * itself and fail with exit code 127. */
+    /* If the target is /proc/<pid>/exe, resolve the symlink NOW.  After the
+     * exec it points at whatever file we end up executing (a staged copy or
+     * ld-linux), which is useless to re-exec. */
     if (strncmp(current_host, "/proc/", 6) == 0) {
         const char *p = current_host + 6;
         while (*p >= '0' && *p <= '9') p++;
@@ -625,8 +620,8 @@ static int handle_exec_interp(KleeProcess *proc, KleeInterceptor *ic,
     char interp_host[PATH_MAX] = {0};   /* Shebang interpreter (host path) */
     char interp_guest[PATH_MAX] = {0};  /* Shebang interpreter (guest path) */
     char shebang_arg[PATH_MAX] = {0};   /* Shebang optional argument */
-    char ldlinux_host[PATH_MAX] = {0};  /* ELF PT_INTERP (host path) */
-    char ldlinux_guest[PATH_MAX] = {0}; /* ELF PT_INTERP (guest path) */
+    char loader_host[PATH_MAX] = {0};   /* ELF PT_INTERP (host path) */
+    char loader_guest[PATH_MAX] = {0};  /* ELF PT_INTERP (guest path) */
 
     /* Step 1: Resolve shebang chain (scripts pointing to scripts) */
     for (int depth = 0; depth < 5; depth++) {
@@ -660,86 +655,117 @@ static int handle_exec_interp(KleeProcess *proc, KleeInterceptor *ic,
         snprintf(current_host, sizeof(current_host), "%s", sb_translated);
     }
 
-    /* Step 2: Check final binary for ELF PT_INTERP */
-    char pt_interp[PATH_MAX];
-    if (read_elf_interp(current_host, pt_interp, sizeof(pt_interp)) == 0) {
+    /* Step 2: Check the final binary's ELF PT_INTERP.  Only act when the
+     * kernel's own lookup would load a different file than the one the
+     * sandbox maps at that path; otherwise leave the exec alone. */
+    KleeElfInfo elf;
+    if (klee_elf_read_interp(current_host, &elf) == 0) {
         char pt_translated[PATH_MAX];
-        int rc = klee_path_guest_to_host(&ctx, pt_interp, pt_translated, AT_FDCWD);
-        if (rc == 0 && strcmp(pt_interp, pt_translated) != 0 &&
-            !same_host_file(pt_interp, pt_translated)) {
-            snprintf(ldlinux_host, sizeof(ldlinux_host), "%s", pt_translated);
-            snprintf(ldlinux_guest, sizeof(ldlinux_guest), "%s", pt_interp);
+        int rc = klee_path_guest_to_host(&ctx, elf.interp, pt_translated, AT_FDCWD);
+        if (rc == 0 && strcmp(elf.interp, pt_translated) != 0 &&
+            !same_host_file(elf.interp, pt_translated)) {
+            snprintf(loader_host, sizeof(loader_host), "%s", pt_translated);
+            snprintf(loader_guest, sizeof(loader_guest), "%s", elf.interp);
             KLEE_TRACE("elf: PT_INTERP %s -> %s (binary=%s)",
-                       pt_interp, pt_translated, current_host);
+                       elf.interp, pt_translated, current_host);
         }
     }
 
+    bool need_loader = loader_host[0] != '\0';
+    bool take_script = interp_host[0] != '\0';
+
     /* Step 3: If nothing needs rewriting, return */
-    if (!interp_host[0] && !ldlinux_host[0])
+    if (!need_loader && !take_script)
         return 0;
 
-    /* Step 4: Build the final execve command.
+    /* Step 4: Choose the host path to exec.
      *
-     * The kernel expects: execve(filename, argv, env)
+     * The filename must be a HOST path: the kernel opens it directly,
+     * bypassing klee's mount table.  Its last component becomes the
+     * process's comm, so exec through a symlink named like the program (or
+     * the script) instead of naming a loader or interpreter directly.
      *
-     * Original:  execve(translated_script, [argv0, argv1, ...], env)
+     * A binary that needs the sandbox's loader is run as a private copy
+     * whose PT_INTERP points at that loader (exec_shim.c).  The kernel then
+     * loads the loader itself and argv stays exactly as the caller built
+     * it, so ps, pgrep, pidof and the program's own argv[0] all see the real
+     * program.  If no copy can be made, fall back to executing ld.so with
+     * the program as its first argument, which costs the loader prefix in
+     * cmdline and the resolved path in argv[0]. */
+    char name[NAME_MAX + 1];
+    exec_comm_name(proc->saved_path, current_host, name, sizeof(name));
+
+    KleeExecShim *shim = klee_exec_shim_get();
+    char filename_host[PATH_MAX];
+    bool via_ldso = false;
+
+    if (need_loader) {
+        if (klee_exec_shim_prepare(shim, current_host, &elf, loader_host, name,
+                                   filename_host, sizeof(filename_host)) == 0) {
+            KLEE_TRACE("exec shim: %s -> %s", current_host, filename_host);
+        } else {
+            via_ldso = true;
+            if (klee_exec_shim_alias(shim, loader_host, name, filename_host,
+                                     sizeof(filename_host)) != 0)
+                snprintf(filename_host, sizeof(filename_host), "%s", loader_host);
+        }
+    } else if (klee_exec_shim_alias(shim, interp_host, name, filename_host,
+                                    sizeof(filename_host)) != 0) {
+        snprintf(filename_host, sizeof(filename_host), "%s", interp_host);
+    }
+
+    klee_regs_fetch(ic, proc);
+    uint64_t rsp = klee_regs_get_sp(proc);
+
+    uint64_t addr_filename = rsp - 128 - PATH_MAX;
+    int rc = klee_write_string(ic, ev->pid, (void *)(uintptr_t)addr_filename,
+                               filename_host);
+    if (rc < 0) return 0;
+
+    /* If path wasn't already modified by translate_path_arg, we need to
+     * save the original path arg for exit-time restore (exec failure case)
+     * and set up the register pointing to the scratch area. */
+    if (!proc->path_modified) {
+        proc->saved_args[path_arg] = ev->args[path_arg];
+        proc->path_arg_idx[proc->path_arg_count++] = path_arg;
+        proc->path_modified = true;
+    }
+
+    klee_regs_set_arg(proc, path_arg, addr_filename);
+    klee_regs_push(ic, proc);
+
+    /* A plain binary started through the shim keeps the caller's argv. */
+    if (!via_ldso && !take_script) {
+        KLEE_TRACE("exec: %s as %s, argv untouched", proc->resolved_guest,
+                   filename_host);
+        return 0;
+    }
+
+    /* Step 5: Rebuild argv.
      *
-     * IMPORTANT: The filename (rdi) must be a HOST path — the kernel opens
-     * this file directly, bypassing klee's mount table.  But argv entries
-     * must be GUEST paths — the spawned interpreter runs under klee's
-     * interception, so any paths it opens from argv will be translated
-     * through the mount table.  Using host paths in argv would cause
-     * double-translation (host path → mount table → nonexistent path).
+     * argv entries must be GUEST paths — the loader or interpreter runs
+     * under klee's interception, so any paths it opens from argv will be
+     * translated through the mount table.  Using host paths in argv would
+     * cause double-translation (host path → mount table → nonexistent path).
      *
-     * Final layout:
-     *   filename (rdi) = ldlinux_host or interp_host (HOST path for kernel)
-     *   argv = [ldlinux_guest?] [interp_guest?] [shebang_arg?] script_guest [orig_argv1 ...]
+     *   argv = [loader_guest?] [interp_guest?] [shebang_arg?] script_guest [orig_argv1 ...]
      */
 
-    /* Read original argv from tracee */
-    uint64_t argv_base = ev->args[1];
+    /* Read original argv from tracee (4-byte pointers for a 32-bit caller) */
+    size_t psz = klee_abi_ptr_size(proc->abi);
+    uint64_t argv_base = ev->args[argv_arg];
     uint64_t argv_ptrs[256];
     int argc = 0;
     for (int i = 0; i < 255; i++) {
         uint64_t ptr;
-        int rc = klee_read_mem(ic, ev->pid, &ptr,
-                               (void *)(uintptr_t)(argv_base + (unsigned)i * sizeof(uint64_t)),
-                               sizeof(uint64_t));
+        rc = klee_abi_read_ptr(ic, ev->pid, proc->abi,
+                               argv_base + (uint64_t)i * psz, &ptr);
         if (rc < 0) return 0;
         argv_ptrs[i] = ptr;
         if (ptr == 0) break;
         argc++;
     }
 
-    klee_regs_fetch(ic, proc);
-    uint64_t rsp = klee_regs_get_sp(proc);
-
-    /* Write the HOST path for the filename register (rdi).  The kernel
-     * opens this file directly — it must be a real host filesystem path.
-     * This is ld-linux (if PT_INTERP needed translation) or the shebang
-     * interpreter (if only shebang rewriting). */
-    const char *filename_host = ldlinux_host[0] ? ldlinux_host : interp_host;
-    uint64_t addr_filename = rsp - 128 - PATH_MAX;
-    int rc;
-    rc = klee_write_string(ic, ev->pid, (void *)(uintptr_t)addr_filename,
-                           filename_host);
-    if (rc < 0) return 0;
-
-    /* If path wasn't already modified by translate_path_arg, we need to
-     * save the original arg[0] for exit-time restore (exec failure case)
-     * and set up the register pointing to the scratch area. */
-    if (!proc->path_modified) {
-        proc->saved_args[0] = ev->args[0];
-        proc->path_arg_idx[proc->path_arg_count++] = 0;
-        proc->path_modified = true;
-    }
-
-    klee_regs_set_arg(proc, 0, addr_filename);
-    klee_regs_push(ic, proc);
-
-    /* Write GUEST paths for argv entries.  The spawned interpreter runs
-     * under klee's interception, so paths it opens will be translated
-     * through the mount table — they must be guest-relative. */
     uint64_t scratch = rsp - 128 - PATH_MAX * 5;
 
     uint64_t addr_ldlinux = 0;
@@ -747,9 +773,9 @@ static int handle_exec_interp(KleeProcess *proc, KleeInterceptor *ic,
     uint64_t addr_shebang_arg = 0;
     uint64_t addr_script = 0;
 
-    if (ldlinux_guest[0]) {
+    if (via_ldso) {
         addr_ldlinux = scratch;
-        rc = klee_write_string(ic, ev->pid, (void *)(uintptr_t)addr_ldlinux, ldlinux_guest);
+        rc = klee_write_string(ic, ev->pid, (void *)(uintptr_t)addr_ldlinux, loader_guest);
         if (rc < 0) return 0;
         scratch -= PATH_MAX;
     }
@@ -793,25 +819,33 @@ static int handle_exec_interp(KleeProcess *proc, KleeInterceptor *ic,
         new_argv[new_argc++] = argv_ptrs[i];
     new_argv[new_argc] = 0; /* NULL terminator */
 
-    /* Write new argv array to scratch area */
-    uint64_t argv_addr = (scratch - (uint64_t)(new_argc + 1) * sizeof(uint64_t)) & ~7ULL;
-    rc = klee_write_mem(ic, ev->pid, (void *)(uintptr_t)argv_addr,
-                        new_argv, (size_t)(new_argc + 1) * sizeof(uint64_t));
+    /* Write new argv array to scratch area, in the caller's pointer size */
+    uint64_t argv_addr = (scratch - (uint64_t)(new_argc + 1) * psz) & ~7ULL;
+    if (psz == 4) {
+        uint32_t new_argv32[260];
+        for (int i = 0; i <= new_argc; i++)
+            new_argv32[i] = (uint32_t)new_argv[i];
+        rc = klee_write_mem(ic, ev->pid, (void *)(uintptr_t)argv_addr,
+                            new_argv32, (size_t)(new_argc + 1) * sizeof(uint32_t));
+    } else {
+        rc = klee_write_mem(ic, ev->pid, (void *)(uintptr_t)argv_addr,
+                            new_argv, (size_t)(new_argc + 1) * sizeof(uint64_t));
+    }
     if (rc < 0) return 0;
 
     /* filename (rdi) = host path (already set above).
      * argv (rsi) = new array with guest paths. */
-    klee_regs_set_arg(proc, 1, argv_addr);
+    klee_regs_set_arg(proc, argv_arg, argv_addr);
     klee_regs_push(ic, proc);
 
     /* Save original argv pointer for exit-time restore (exec failure case) */
-    proc->saved_args[1] = ev->args[1];
-    proc->path_arg_idx[proc->path_arg_count++] = 1;
+    proc->saved_args[argv_arg] = ev->args[argv_arg];
+    proc->path_arg_idx[proc->path_arg_count++] = argv_arg;
 
     KLEE_TRACE("exec interp: filename=%s argv=[%s%s%s %s ...]",
                filename_host,
-               ldlinux_guest[0] ? ldlinux_guest : "",
-               ldlinux_guest[0] ? ", " : "",
+               via_ldso ? loader_guest : "",
+               via_ldso ? ", " : "",
                interp_guest[0] ? interp_guest : "",
                proc->resolved_guest);
     return 0;
@@ -820,16 +854,16 @@ static int handle_exec_interp(KleeProcess *proc, KleeInterceptor *ic,
 /* Scan tracee argv for --no-sandbox (used for per-process UID virt in Zypak mode).
  * Returns true if found. Reads up to 256 argv entries from tracee memory. */
 static bool tracee_argv_has_no_sandbox(KleeInterceptor *ic, pid_t pid,
-                                        uint64_t argv_addr)
+                                        KleeAbi abi, uint64_t argv_addr)
 {
     if (!argv_addr)
         return false;
 
+    size_t psz = klee_abi_ptr_size(abi);
     for (int i = 0; i < 256; i++) {
         uint64_t ptr = 0;
-        int rc = klee_read_mem(ic, pid, &ptr,
-                               (const void *)(uintptr_t)(argv_addr + (uint64_t)i * 8),
-                               sizeof(ptr));
+        int rc = klee_abi_read_ptr(ic, pid, abi, argv_addr + (uint64_t)i * psz,
+                                   &ptr);
         if (rc < 0 || ptr == 0)
             break;
 
@@ -998,7 +1032,7 @@ int klee_enter_execve(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
      * host's ld-linux and the runtime's libc. */
     if (proc->sandbox && proc->sandbox->mount_table &&
         ic->backend == INTERCEPT_PTRACE) {
-        handle_exec_interp(proc, ic, ev);
+        handle_exec_interp(proc, ic, ev, 0, 1);
     }
 
     /* Save exe path for vexe update on exit */
@@ -1010,7 +1044,7 @@ int klee_enter_execve(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
      * AUTH EXTERNAL.  Processes without it (zygote, utility) keep virtual
      * uid to pass Chrome's root check. */
     if (proc->sandbox && proc->sandbox->zypak_detected) {
-        proc->skip_uid_virt = tracee_argv_has_no_sandbox(ic, ev->pid, ev->args[1]);
+        proc->skip_uid_virt = tracee_argv_has_no_sandbox(ic, ev->pid, proc->abi, ev->args[1]);
         KLEE_DEBUG("execve pid=%d %s: skip_uid_virt=%d",
                    proc->real_pid, proc->saved_path, proc->skip_uid_virt);
     }
@@ -1020,12 +1054,36 @@ int klee_enter_execve(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 
 int klee_enter_execveat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
+    /* execveat(dirfd, pathname, argv, envp, flags) */
     int rc = translate_path_arg(proc, ic, ev, 1, 0);
     if (rc < 0) return rc;
-    snprintf(proc->vexe, PATH_MAX, "%s", proc->saved_path);
+
+    char guest_exe[PATH_MAX];
+    snprintf(guest_exe, sizeof(guest_exe), "%s", proc->saved_path);
+
+    if ((ev->args[4] & AT_EMPTY_PATH) && proc->saved_path[0] == '\0') {
+        /* fexecve(): the program is dirfd itself.  Its host file is
+         * reachable through /proc, which works for reading the ELF, for
+         * staging a copy and, if nothing needs rewriting, for the exec. */
+        int fd = (int)ev->args[0];
+        snprintf(proc->translated_path, PATH_MAX, "/proc/%d/fd/%d",
+                 proc->real_pid, fd);
+        const char *vpath = proc->fd_table ? klee_fd_table_get(proc->fd_table, fd) : NULL;
+        snprintf(proc->resolved_guest, PATH_MAX, "%s", vpath ? vpath : "");
+        snprintf(guest_exe, sizeof(guest_exe), "%s", vpath ? vpath : "");
+    }
+
+    /* Interpreter/loader handling as for execve.  A rewritten filename is
+     * absolute, so the kernel ignores dirfd and AT_EMPTY_PATH for it. */
+    if (proc->sandbox && proc->sandbox->mount_table &&
+        ic->backend == INTERCEPT_PTRACE &&
+        (proc->translated_path[0] == '/'))
+        handle_exec_interp(proc, ic, ev, 1, 2);
+
+    snprintf(proc->vexe, PATH_MAX, "%s", guest_exe);
 
     if (proc->sandbox && proc->sandbox->zypak_detected)
-        proc->skip_uid_virt = tracee_argv_has_no_sandbox(ic, ev->pid, ev->args[2]);
+        proc->skip_uid_virt = tracee_argv_has_no_sandbox(ic, ev->pid, proc->abi, ev->args[2]);
 
     return 0;
 }
@@ -1138,17 +1196,26 @@ int klee_enter_fchmodat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 
 int klee_enter_chown(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    return translate_path_arg(proc, ic, ev, 0, -1);
+    int rc = translate_path_arg(proc, ic, ev, 0, -1);
+    if (rc < 0) return rc;
+    return check_readonly(proc, ev->syscall_nr);
 }
 
 int klee_enter_lchown(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    return translate_path_arg_nofollow(proc, ic, ev, 0, -1);
+    int rc = translate_path_arg_nofollow(proc, ic, ev, 0, -1);
+    if (rc < 0) return rc;
+    return check_readonly(proc, ev->syscall_nr);
 }
 
 int klee_enter_fchownat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    return translate_path_arg(proc, ic, ev, 1, 0);
+    /* fchownat(dirfd, path, uid, gid, flags) */
+    bool nofollow = (ev->args[4] & AT_SYMLINK_NOFOLLOW) != 0;
+    int rc = nofollow ? translate_path_arg_nofollow(proc, ic, ev, 1, 0)
+                      : translate_path_arg(proc, ic, ev, 1, 0);
+    if (rc < 0) return rc;
+    return check_readonly(proc, ev->syscall_nr);
 }
 
 int klee_enter_truncate(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
@@ -1259,6 +1326,23 @@ static bool pgrp_in_namespace(const KleePidMap *pm, pid_t pgid)
     return false;
 }
 
+/* Resolve a process-group argument.  Shells hold real pgids (fork()
+ * returns real PIDs), possibly of a leader that has already exited, so
+ * check membership first; getpgrp() hands out virtual ones.  Returns the
+ * real pgid, or 0 if no process in this namespace belongs to it. */
+static pid_t resolve_target_pgid(KleeProcess *proc, pid_t pgid)
+{
+    KleePidMap *pm = proc->sandbox->pid_map;
+    if (pgid <= 0)
+        return 0;
+    if (pgrp_in_namespace(pm, pgid))
+        return pgid;
+    pid_t leader = klee_pid_map_v2r(pm, pgid);
+    if (leader > 0 && pgrp_in_namespace(pm, leader))
+        return leader;
+    return 0;
+}
+
 /* kill(-1, sig) in a PID namespace reaches every process in it except init
  * and the caller's own thread group.  Deliver it to exactly those, then turn
  * the syscall into a harmless kill(self, 0) so the caller still sees 0. */
@@ -1317,19 +1401,8 @@ int klee_enter_kill(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     if (target > 0) {
         real = resolve_target_pid(proc, target);
     } else {
-        /* Process groups: shells hold the real pgid (fork() returns real
-         * PIDs), possibly of a leader that has already exited, so check
-         * membership first; getpgrp() hands out virtual ones. */
-        pid_t pgid = -target;
-        KleePidMap *pm = proc->sandbox->pid_map;
-        real = 0;
-        if (pgrp_in_namespace(pm, pgid)) {
-            real = target;
-        } else {
-            pid_t leader = klee_pid_map_v2r(pm, pgid);
-            if (leader > 0 && pgrp_in_namespace(pm, leader))
-                real = -leader;
-        }
+        pid_t rpgid = resolve_target_pgid(proc, -target);
+        real = rpgid > 0 ? -rpgid : 0;
     }
 
     if (real == 0) {
@@ -1374,16 +1447,19 @@ static int translate_tgid_tid(KleeProcess *proc, KleeInterceptor *ic,
     return 0;
 }
 
-/* Shared by tkill, rt_sigqueueinfo and pidfd_open: a single PID in arg0. */
-static int translate_target_arg0(KleeProcess *proc, KleeInterceptor *ic,
-                                 KleeEvent *ev, const char *name)
+/* A PID in argument idx.  0 (and negative values, which are process-group
+ * or "all" forms the callers handle themselves) is left alone; anything
+ * else must name a process in this namespace, or the call fails with
+ * ESRCH as it would in a real PID namespace where host PIDs do not exist. */
+static int translate_pid_arg(KleeProcess *proc, KleeInterceptor *ic,
+                             KleeEvent *ev, int idx, const char *name)
 {
     if (!proc->sandbox || !proc->sandbox->unshare_pid || !proc->sandbox->pid_map)
         return 0;
 
-    pid_t vpid = (pid_t)ev->args[0];
+    pid_t vpid = (pid_t)ev->args[idx];
     if (vpid <= 0)
-        return 0; /* never a process-group form here; kernel rejects it */
+        return 0;
     pid_t real = resolve_target_pid(proc, vpid);
     if (real <= 0) {
         KLEE_TRACE("%s: pid=%d target=%d not in namespace -> ESRCH", name,
@@ -1393,9 +1469,112 @@ static int translate_target_arg0(KleeProcess *proc, KleeInterceptor *ic,
 
     if (real != vpid) {
         klee_regs_fetch(ic, proc);
-        klee_regs_set_arg(proc, 0, (uint64_t)real);
+        klee_regs_set_arg(proc, idx, (uint64_t)real);
         klee_regs_push(ic, proc);
     }
+    return 0;
+}
+
+/* A process group in argument idx (0 = the caller's own, left alone). */
+static int translate_pgid_arg(KleeProcess *proc, KleeInterceptor *ic,
+                              KleeEvent *ev, int idx, const char *name)
+{
+    if (!proc->sandbox || !proc->sandbox->unshare_pid || !proc->sandbox->pid_map)
+        return 0;
+
+    pid_t pgid = (pid_t)ev->args[idx];
+    if (pgid <= 0)
+        return 0;
+    pid_t real = resolve_target_pgid(proc, pgid);
+    if (real <= 0) {
+        KLEE_TRACE("%s: pid=%d pgid=%d not in namespace -> ESRCH", name,
+                   proc->real_pid, pgid);
+        return -ESRCH;
+    }
+    if (real != pgid) {
+        klee_regs_fetch(ic, proc);
+        klee_regs_set_arg(proc, idx, (uint64_t)real);
+        klee_regs_push(ic, proc);
+    }
+    return 0;
+}
+
+/* Shared by tkill, rt_sigqueueinfo and pidfd_open: a single PID in arg0. */
+static int translate_target_arg0(KleeProcess *proc, KleeInterceptor *ic,
+                                 KleeEvent *ev, const char *name)
+{
+    return translate_pid_arg(proc, ic, ev, 0, name);
+}
+
+/* ==================== clone / unshare: what threads share ==================== */
+
+/* Remember the flags of a clone in flight: the fork event that follows
+ * uses them to share or copy the creator's cwd and fd table. */
+int klee_enter_clone(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    (void)ic;
+    proc->pending_clone_flags = (unsigned long)ev->args[0];
+    return 0;
+}
+
+int klee_enter_clone3(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    /* clone3(struct clone_args *args, size): flags is the first u64 */
+    uint64_t flags = 0;
+    if (ev->args[0] &&
+        klee_read_mem(ic, ev->pid, &flags, (const void *)(uintptr_t)ev->args[0],
+                      sizeof(flags)) == 0)
+        proc->pending_clone_flags = (unsigned long)flags;
+    return 0;
+}
+
+int klee_enter_unshare(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    (void)ic;
+    klee_process_unshare(proc, (unsigned long)ev->args[0]);
+    return 0;
+}
+
+/* sched_*, prlimit64, process_vm_*, get_robust_list, move_pages,
+ * migrate_pages: the target pid is arg0, 0 meaning the caller. */
+int klee_enter_pid_arg0(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    return translate_pid_arg(proc, ic, ev, 0, "pid-arg");
+}
+
+int klee_enter_kcmp(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    int rc = translate_pid_arg(proc, ic, ev, 0, "kcmp");
+    if (rc < 0) return rc;
+    return translate_pid_arg(proc, ic, ev, 1, "kcmp");
+}
+
+int klee_enter_perf_event_open(KleeProcess *proc, KleeInterceptor *ic,
+                               KleeEvent *ev)
+{
+    /* perf_event_open(attr, pid, cpu, group_fd, flags); pid -1 = any */
+    return translate_pid_arg(proc, ic, ev, 1, "perf_event_open");
+}
+
+int klee_enter_prio(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    /* setpriority/getpriority(which, who, ...) */
+    int which = (int)ev->args[0];
+    if (which == PRIO_PROCESS)
+        return translate_pid_arg(proc, ic, ev, 1, "setpriority");
+    if (which == PRIO_PGRP)
+        return translate_pgid_arg(proc, ic, ev, 1, "setpriority");
+    return 0;
+}
+
+int klee_enter_ioprio(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    /* ioprio_set/ioprio_get(which, who, ...) */
+    int which = (int)ev->args[0];
+    if (which == 1 /* IOPRIO_WHO_PROCESS */)
+        return translate_pid_arg(proc, ic, ev, 1, "ioprio");
+    if (which == 2 /* IOPRIO_WHO_PGRP */)
+        return translate_pgid_arg(proc, ic, ev, 1, "ioprio");
     return 0;
 }
 
@@ -1794,14 +1973,19 @@ int klee_enter_seccomp(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     unsigned int operation = (unsigned int)ev->args[0];
 
     if (operation == SECCOMP_SET_MODE_FILTER) {
-        void *fprog_addr = (void *)(uintptr_t)ev->args[2];
+        uint64_t fprog_addr = ev->args[2];
 
         if (fprog_addr) {
-            struct sock_fprog fprog;
-            int rc = klee_read_mem(ic, ev->pid, &fprog, fprog_addr, sizeof(fprog));
-            if (rc == 0 && fprog.filter && fprog.len > 0) {
-                klee_compat_handle_seccomp_filter(ic, ev->pid, &fprog,
-                                                   fprog_addr,
+            uint16_t len = 0;
+            uint64_t filter = 0;
+            int rc = klee_abi_read_fprog(ic, ev->pid, proc->abi, fprog_addr,
+                                         &len, &filter);
+            if (rc == 0 && filter && len > 0) {
+                /* The rewriter stages its filter below the stack: use the
+                 * stack pointer of this stop, not a stale one. */
+                klee_regs_fetch(ic, proc);
+                klee_compat_handle_seccomp_filter(ic, ev->pid, proc->abi,
+                                                   len, filter, fprog_addr,
                                                    klee_regs_get_sp(proc));
             }
         }
@@ -1814,6 +1998,120 @@ int klee_enter_inotify_add_watch(KleeProcess *proc, KleeInterceptor *ic,
                                   KleeEvent *ev)
 {
     return translate_path_arg(proc, ic, ev, 1, -1);
+}
+
+/* ==================== Timestamps, xattrs, statfs, mount ids ==================== */
+
+#ifndef FAN_MARK_DONT_FOLLOW
+#define FAN_MARK_DONT_FOLLOW 0x00000004
+#endif
+
+/* A read-only check for "the file this descriptor refers to", used when a
+ * path argument is NULL (utimensat(fd, NULL, ...) is futimens). */
+static int check_readonly_fd(KleeProcess *proc, int fd, int syscall_nr)
+{
+    if (!proc->sandbox || !proc->sandbox->mount_table || !proc->fd_table)
+        return 0;
+    const char *vpath = klee_fd_table_get(proc->fd_table, fd);
+    if (!vpath)
+        return 0;
+    if (klee_readonly_check_path(proc->sandbox->mount_table, vpath, syscall_nr))
+        return -EROFS;
+    return 0;
+}
+
+/* Translate a path argument and, for a modifying call, refuse it on a
+ * read-only mount.  Handles a NULL path (operate on dirfd) too. */
+static int enter_path_at(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev,
+                         int path_idx, int dirfd_idx, bool nofollow, bool write)
+{
+    if (!ev->args[path_idx]) {
+        if (write && dirfd_idx >= 0)
+            return check_readonly_fd(proc, (int)ev->args[dirfd_idx],
+                                     ev->syscall_nr);
+        return 0;
+    }
+    int rc = nofollow ? translate_path_arg_nofollow(proc, ic, ev, path_idx, dirfd_idx)
+                      : translate_path_arg(proc, ic, ev, path_idx, dirfd_idx);
+    if (rc < 0) return rc;
+    return write ? check_readonly(proc, ev->syscall_nr) : 0;
+}
+
+int klee_enter_utimensat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    /* utimensat(dirfd, path, times, flags) */
+    return enter_path_at(proc, ic, ev, 1, 0,
+                         (ev->args[3] & AT_SYMLINK_NOFOLLOW) != 0, true);
+}
+
+int klee_enter_utimes(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    /* utimes(path, times) / utime(path, buf) */
+    return enter_path_at(proc, ic, ev, 0, -1, false, true);
+}
+
+int klee_enter_futimesat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    /* futimesat(dirfd, path, times) */
+    return enter_path_at(proc, ic, ev, 1, 0, false, true);
+}
+
+int klee_enter_xattr_write(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    /* setxattr(path, ...), removexattr(path, ...) */
+    return enter_path_at(proc, ic, ev, 0, -1, false, true);
+}
+
+int klee_enter_lxattr_write(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    return enter_path_at(proc, ic, ev, 0, -1, true, true);
+}
+
+int klee_enter_xattr_read(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    /* getxattr(path, ...), listxattr(path, ...) */
+    return enter_path_at(proc, ic, ev, 0, -1, false, false);
+}
+
+int klee_enter_lxattr_read(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    return enter_path_at(proc, ic, ev, 0, -1, true, false);
+}
+
+int klee_enter_statfs(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    /* statfs(path, buf); i386 statfs64(path, sz, buf) lands here too */
+    return enter_path_at(proc, ic, ev, 0, -1, false, false);
+}
+
+int klee_enter_fchmodat2(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    /* fchmodat2(dirfd, path, mode, flags) */
+    return enter_path_at(proc, ic, ev, 1, 0,
+                         (ev->args[3] & AT_SYMLINK_NOFOLLOW) != 0, true);
+}
+
+int klee_enter_fanotify_mark(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    /* fanotify_mark(fanotify_fd, flags, mask, dirfd, path) */
+    return enter_path_at(proc, ic, ev, 4, 3,
+                         (ev->args[1] & FAN_MARK_DONT_FOLLOW) != 0, false);
+}
+
+int klee_enter_name_to_handle_at(KleeProcess *proc, KleeInterceptor *ic,
+                                 KleeEvent *ev)
+{
+    /* name_to_handle_at(dirfd, path, handle, mount_id, flags): the final
+     * symlink is only followed with AT_SYMLINK_FOLLOW */
+    return enter_path_at(proc, ic, ev, 1, 0,
+                         (ev->args[4] & AT_SYMLINK_FOLLOW) == 0, false);
+}
+
+int klee_enter_open_tree(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    /* open_tree(dirfd, path, flags) */
+    return enter_path_at(proc, ic, ev, 1, 0,
+                         (ev->args[2] & AT_SYMLINK_NOFOLLOW) != 0, false);
 }
 
 int klee_enter_io_uring_setup(KleeProcess *proc, KleeInterceptor *ic,
@@ -1995,75 +2293,61 @@ int klee_enter_sendmsg(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
         return 0;
 
     /* sendmsg(int sockfd, const struct msghdr *msg, int flags) */
-    void *msg_addr = (void *)(uintptr_t)ev->args[1];
-    if (!msg_addr)
+    if (!ev->args[1])
         return 0;
 
-    /* Read msghdr from tracee */
-    struct msghdr msg;
-    int rc = klee_read_mem(ic, ev->pid, &msg, msg_addr, sizeof(msg));
+    uint64_t ctrl_addr = 0;
+    size_t ctrllen = 0;
+    if (klee_abi_read_msg_control(ic, ev->pid, proc->abi, ev->args[1],
+                                  &ctrl_addr, &ctrllen) < 0)
+        return 0;
+    if (!ctrl_addr || ctrllen == 0 || ctrllen > 4096)
+        return 0;
+
+    uint8_t ctrl_buf[4096];
+    int rc = klee_read_mem(ic, ev->pid, ctrl_buf,
+                           (const void *)(uintptr_t)ctrl_addr, ctrllen);
     if (rc < 0)
         return 0;
 
-    if (!msg.msg_control || msg.msg_controllen == 0)
-        return 0;
-
-    /* Sanity limit on control data size */
-    size_t ctrllen = msg.msg_controllen;
-    if (ctrllen > 4096)
-        return 0;
-
-    /* Read control data from tracee */
-    char ctrl_buf[4096];
-    void *ctrl_addr = msg.msg_control;
-    rc = klee_read_mem(ic, ev->pid, ctrl_buf, ctrl_addr, ctrllen);
-    if (rc < 0)
-        return 0;
-
-    /* Walk cmsghdr entries looking for SCM_CREDENTIALS */
+    /* Walk cmsghdr entries (in the tracee's layout) looking for SCM_CREDENTIALS */
     bool modified = false;
-    struct msghdr local_msg;
-    memset(&local_msg, 0, sizeof(local_msg));
-    local_msg.msg_control = ctrl_buf;
-    local_msg.msg_controllen = ctrllen;
+    size_t off = 0, data_off, data_len;
+    int level, type;
+    while (klee_abi_cmsg_next(proc->abi, ctrl_buf, ctrllen, &off,
+                              &level, &type, &data_off, &data_len)) {
+        if (level != SOL_SOCKET || type != SCM_CREDENTIALS ||
+            data_len < sizeof(struct ucred))
+            continue;
+        struct ucred cred;
+        memcpy(&cred, ctrl_buf + data_off, sizeof(cred));
 
-    for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&local_msg);
-         cmsg != NULL;
-         cmsg = CMSG_NXTHDR(&local_msg, cmsg)) {
-        if (cmsg->cmsg_level == SOL_SOCKET &&
-            cmsg->cmsg_type == SCM_CREDENTIALS &&
-            cmsg->cmsg_len >= CMSG_LEN(sizeof(struct ucred))) {
-            struct ucred *cred = (struct ucred *)CMSG_DATA(cmsg);
+        /* Translate credentials: the guest process sends its virtual
+         * pid/uid/gid, but the kernel validates against real values.
+         * Rewrite to the real pid and the klee host process's actual
+         * uid/gid (what the kernel expects); the virtual uid/gid are
+         * purely for in-sandbox presentation. */
+        uid_t host_uid = getuid();
+        gid_t host_gid = getgid();
 
-            /* Translate credentials: the guest process sends its
-             * virtual pid/uid/gid, but the kernel validates against
-             * real values.  Rewrite to real pid and the klee host
-             * process's actual uid/gid (what the kernel expects).
-             *
-             * Use the host uid/gid (not virtual ones from id_state)
-             * because the kernel checks that SCM_CREDENTIALS match
-             * the sending process's real credentials.  The virtual
-             * uid/gid are purely for in-sandbox presentation. */
-            uid_t host_uid = getuid();
-            gid_t host_gid = getgid();
+        KLEE_TRACE("sendmsg SCM_CREDENTIALS: pid=%d uid=%d gid=%d -> "
+                   "pid=%d uid=%d gid=%d",
+                   cred.pid, cred.uid, cred.gid,
+                   proc->real_pid, host_uid, host_gid);
 
-            KLEE_TRACE("sendmsg SCM_CREDENTIALS: pid=%d uid=%d gid=%d -> "
-                       "pid=%d uid=%d gid=%d",
-                       cred->pid, cred->uid, cred->gid,
-                       proc->real_pid, host_uid, host_gid);
-
-            cred->pid = proc->real_pid;
-            cred->uid = host_uid;
-            cred->gid = host_gid;
-            modified = true;
-        }
+        cred.pid = proc->real_pid;
+        cred.uid = host_uid;
+        cred.gid = host_gid;
+        memcpy(ctrl_buf + data_off, &cred, sizeof(cred));
+        modified = true;
     }
 
     if (!modified)
         return 0;
 
     /* Write modified control data back to tracee (same address, same size) */
-    rc = klee_write_mem(ic, ev->pid, ctrl_addr, ctrl_buf, ctrllen);
+    rc = klee_write_mem(ic, ev->pid, (void *)(uintptr_t)ctrl_addr, ctrl_buf,
+                        ctrllen);
     if (rc < 0)
         KLEE_DEBUG("sendmsg: failed to write back SCM_CREDENTIALS: %d", rc);
 

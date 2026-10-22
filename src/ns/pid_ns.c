@@ -50,20 +50,23 @@ pid_t klee_pid_map_add(KleePidMap *pm, pid_t real_pid)
     if (existing > 0)
         return existing;
 
-    pid_t vpid = pm->next_vpid;
-
-    /* Guard against wraparound: pid_t is signed 32-bit, valid range 1..INT_MAX.
-     * Exhausting 2 billion PIDs is practically impossible, but defend against
-     * corruption or bugs that skip large ranges. */
-    if (vpid <= 0 || vpid >= (pid_t)0x7FFFFFFF) {
-        KLEE_WARN("pid_map: virtual PID counter exhausted (next=%d), "
-                  "wrapping to 1 — PID collisions may occur", vpid);
-        vpid = 1;
-        /* Skip over any existing mappings to avoid collision */
+    /* Numbering: the first process is init and shows as 1; every other
+     * process keeps its host number.  The kernel writes real ids where klee
+     * cannot follow (CLONE_CHILD_SETTID, SIGCHLD, F_GETLK, PI and robust
+     * futex owners that glibc compares with its cached tid), so sequential
+     * virtual numbers would disagree with getpid()/gettid() and break
+     * pthread_kill and friends.  What a PID namespace must still provide,
+     * containment and a process that is 1, is done by lookup. */
+    pid_t vpid = pm->init_real_pid == 0 ? 1 : real_pid;
+    if (vpid != 1 && klee_ht_get(pm->virtual_to_real, (uint64_t)vpid)) {
+        /* Should not happen: live host pids are unique.  Fall back to the
+         * sequential counter rather than aliasing two processes. */
+        vpid = pm->next_vpid;
         while (klee_ht_get(pm->virtual_to_real, (uint64_t)vpid) && vpid < 0x7FFFFFFF)
             vpid++;
     }
-    pm->next_vpid = vpid + 1;
+    if (vpid >= pm->next_vpid)
+        pm->next_vpid = vpid + 1;
 
     /* Store as (uintptr_t) value in hash table since it stores void* */
     klee_ht_put(pm->real_to_virtual, (uint64_t)real_pid,

@@ -7,6 +7,7 @@
 #include "process/regs.h"
 #include "syscall/dispatch.h"
 #include "syscall/sysnum.h"
+#include "syscall/abi.h"
 #include "ns/pid_ns.h"
 #include "ns/user_ns.h"
 #include "fuse/fuse_proc.h"
@@ -152,7 +153,8 @@ static void handle_fork(KleeEventLoop *el, KleeProcess *parent,
     if (klee_process_find(el->proctable, child_pid))
         return;
 
-    KleeProcess *child = klee_process_fork(el->proctable, parent, child_pid);
+    KleeProcess *child = klee_process_fork(el->proctable, parent, child_pid,
+                                           parent->pending_clone_flags);
     if (!child) {
         KLEE_ERROR("failed to create child process %d", child_pid);
         return;
@@ -179,6 +181,47 @@ static void handle_fork(KleeEventLoop *el, KleeProcess *parent,
 
     KLEE_DEBUG("fork: parent=%d child=%d vpid=%d",
                parent->real_pid, child_pid, child->virtual_pid);
+}
+
+/* The kernel fills si_pid with the sender's host PID.  Present it the way
+ * the namespace does: init is 1, a sender outside the sandbox is 0.  Every
+ * other process keeps its host number, so this rarely has to write.
+ * Only signals that carry a sender are touched: user-sent ones (si_code
+ * <= 0) and SIGCHLD (CLD_*); for faults si_pid aliases si_addr. */
+static void rewrite_siginfo_pid(KleeEventLoop *el, KleeProcess *proc, int sig)
+{
+    if (!el->sandbox || !el->sandbox->unshare_pid || !el->sandbox->pid_map)
+        return;
+
+    siginfo_t si;
+    if (ptrace(PTRACE_GETSIGINFO, proc->real_pid, 0, &si) < 0)
+        return;
+    bool from_child = sig == SIGCHLD && si.si_code >= CLD_EXITED &&
+                      si.si_code <= CLD_CONTINUED;
+    if (!(si.si_code <= 0 || from_child) || si.si_pid <= 0)
+        return;
+
+    KleePidMap *pm = el->sandbox->pid_map;
+    pid_t shown = klee_pid_map_r2v(pm, si.si_pid);
+    if (shown <= 0) {
+        if (from_child) {
+            /* Only a child of a sandbox process raises SIGCHLD here; klee
+             * may already have forgotten it (it exited).  Keep the id. */
+            shown = si.si_pid;
+        } else {
+            /* A zombie klee forgot still belongs to the sandbox. */
+            pid_t ppid = 0;
+            if (klee_proc_status_ids(si.si_pid, NULL, &ppid) == 0 &&
+                (klee_pid_map_r2v(pm, ppid) > 0 || ppid == getpid()))
+                shown = si.si_pid;
+            else
+                shown = 0;   /* a sender outside the namespace */
+        }
+    }
+    if (shown == si.si_pid)
+        return;
+    si.si_pid = shown;
+    ptrace(PTRACE_SETSIGINFO, proc->real_pid, 0, &si);
 }
 
 /* Find the tracee a brand-new task inherits from: its thread group for a
@@ -264,6 +307,17 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
             goto handle_syscall_exit;
         }
         proc->state = PROC_STATE_SYSCALL_ENTER;
+        proc->abi = event->abi;
+        proc->raw_nr = event->raw_nr;
+        proc->sys32_flags = event->abi_flags;
+        proc->arg_shift = 0;
+        proc->demux_mem = false;
+        proc->demux_dirty = false;
+        proc->path_modified = false;
+        proc->pending_clone_flags = 0;
+        /* A 32-bit socketcall/ipc becomes the real call it carries. */
+        if (event->abi == KLEE_ABI_I386 && event->syscall_nr < 0)
+            klee_abi_demux_enter(proc, el->interceptor, event);
         proc->current_syscall = event->syscall_nr;
         proc->seccomp_entered = el->interceptor->backend == INTERCEPT_PTRACE &&
                                  el->interceptor->ptrace.seccomp_filter;
@@ -281,6 +335,8 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
             el->interceptor->respond(el->interceptor, event, -1, -rc);
             return 0;
         }
+        if (el->interceptor->backend == INTERCEPT_PTRACE)
+            klee_abi_demux_commit(proc, el->interceptor, event);
         /* Continue the syscall */
         if (el->interceptor->backend == INTERCEPT_SECCOMP_UNOTIFY) {
             el->interceptor->respond(el->interceptor, event, 0, 0);
@@ -317,6 +373,7 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
     case KLEE_EVENT_SYSCALL_EXIT: {
         proc->state = PROC_STATE_SYSCALL_EXIT;
         event->syscall_nr = proc->current_syscall;
+        klee_abi_demux_exit_args(proc, event);
 
         /* Consolidate all register modifications into a single push */
         bool need_reg_push = false;
@@ -360,6 +417,15 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
             need_reg_push = true;
         }
 
+        /* socketcall: put the original argument pointer back */
+        if (proc->demux_mem && proc->demux_dirty &&
+            el->interceptor->backend == INTERCEPT_PTRACE) {
+            if (!need_reg_push)
+                klee_regs_fetch(el->interceptor, proc);
+            klee_abi_demux_restore(proc);
+            need_reg_push = true;
+        }
+
         if (need_reg_push)
             klee_regs_push(el->interceptor, proc);
 
@@ -389,6 +455,8 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
         proc->state = PROC_STATE_RUNNING;
         proc->path_modified = false;
         proc->path_arg_count = 0;
+        proc->demux_mem = false;
+        proc->arg_shift = 0;
         proc->seccomp_entered = false;
         if (el->interceptor->backend == INTERCEPT_PTRACE)
             el->interceptor->continue_running(el->interceptor, event->pid, 0);
@@ -426,6 +494,8 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
                 sig = 0;
                 proc->suppress_initial_stop = false;
             }
+            if (sig)
+                rewrite_siginfo_pid(el, proc, sig);
             el->interceptor->continue_running(el->interceptor,
                                                event->pid, sig);
         }

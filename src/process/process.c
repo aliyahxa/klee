@@ -8,6 +8,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <sched.h>
 
 KleeProcessTable *klee_proctable_create(void)
 {
@@ -63,15 +64,19 @@ KleeProcess *klee_process_create(KleeProcessTable *pt, pid_t real_pid,
     proc->event_arena = klee_arena_create(4096);
     proc->life_arena = klee_arena_create(4096);
     proc->fd_table = klee_fd_table_create();
+    proc->fs = calloc(1, sizeof(KleeFsState));
 
-    if (!proc->event_arena || !proc->life_arena || !proc->fd_table) {
+    if (!proc->event_arena || !proc->life_arena || !proc->fd_table || !proc->fs) {
         if (proc->event_arena) klee_arena_destroy(proc->event_arena);
         if (proc->life_arena) klee_arena_destroy(proc->life_arena);
         if (proc->fd_table) klee_fd_table_destroy(proc->fd_table);
+        free(proc->fs);
         free(proc);
         return NULL;
     }
 
+    proc->fs->refs = 1;
+    proc->vcwd = proc->fs->cwd;
     strcpy(proc->vcwd, "/");
 
     if (sandbox)
@@ -129,6 +134,8 @@ void klee_process_remove(KleeProcessTable *pt, pid_t real_pid)
         klee_arena_destroy(proc->life_arena);
     if (proc->fd_table)
         klee_fd_table_destroy(proc->fd_table);
+    if (proc->fs && --proc->fs->refs <= 0)
+        free(proc->fs);
     free(proc);
 
     pt->count--;
@@ -136,20 +143,33 @@ void klee_process_remove(KleeProcessTable *pt, pid_t real_pid)
 }
 
 KleeProcess *klee_process_fork(KleeProcessTable *pt, KleeProcess *parent,
-                                pid_t child_real_pid)
+                                pid_t child_real_pid,
+                                unsigned long clone_flags)
 {
     KleeProcess *child = klee_process_create(pt, child_real_pid, parent->sandbox);
     if (!child)
         return NULL;
 
     /* Copy state from parent */
-    memcpy(child->vcwd, parent->vcwd, PATH_MAX);
     memcpy(child->vexe, parent->vexe, PATH_MAX);
     child->skip_uid_virt = parent->skip_uid_virt;
 
-    /* Clone FD table */
+    /* Working directory: shared with CLONE_FS (threads), else a copy */
+    if (clone_flags & CLONE_FS) {
+        free(child->fs);
+        child->fs = parent->fs;
+        child->fs->refs++;
+    } else {
+        memcpy(child->fs->cwd, parent->fs->cwd, PATH_MAX);
+    }
+    child->vcwd = child->fs->cwd;
+
+    /* FD table: shared with CLONE_FILES (threads), else a copy */
     klee_fd_table_destroy(child->fd_table);
-    child->fd_table = klee_fd_table_clone(parent->fd_table);
+    if (clone_flags & CLONE_FILES)
+        child->fd_table = klee_fd_table_ref(parent->fd_table);
+    else
+        child->fd_table = klee_fd_table_clone(parent->fd_table);
 
     /* Link into process tree */
     child->parent = parent;
@@ -159,6 +179,27 @@ KleeProcess *klee_process_fork(KleeProcessTable *pt, KleeProcess *parent,
 
     KLEE_DEBUG("forked: parent=%d child=%d", parent->real_pid, child_real_pid);
     return child;
+}
+
+void klee_process_unshare(KleeProcess *proc, unsigned long flags)
+{
+    if ((flags & CLONE_FS) && proc->fs && proc->fs->refs > 1) {
+        KleeFsState *own = calloc(1, sizeof(KleeFsState));
+        if (own) {
+            memcpy(own->cwd, proc->fs->cwd, PATH_MAX);
+            own->refs = 1;
+            proc->fs->refs--;
+            proc->fs = own;
+            proc->vcwd = own->cwd;
+        }
+    }
+    if ((flags & CLONE_FILES) && proc->fd_table && proc->fd_table->refs > 1) {
+        KleeFdTable *own = klee_fd_table_clone(proc->fd_table);
+        if (own) {
+            klee_fd_table_destroy(proc->fd_table);
+            proc->fd_table = own;
+        }
+    }
 }
 
 void klee_process_exec(KleeProcess *proc, const char *new_exe)

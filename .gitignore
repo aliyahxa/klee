@@ -17,6 +17,10 @@ tests/test_path_resolve
 tests/test_pid_ns
 tests/test_user_ns
 tests/test_fd_table
+tests/test_filter32
 
 # Editor/IDE
 .claude/
+
+# compiler-generated header dependencies
+*.d

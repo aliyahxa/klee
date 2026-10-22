@@ -5,6 +5,9 @@
 #include "seccomp_notif.h"
 #include "filter.h"
 #include "util/log.h"
+#include "syscall/sysnum32.h"
+
+#include <linux/audit.h>
 #include "syscall/sysnum.h"
 
 #include <stdlib.h>
@@ -113,7 +116,15 @@ static int seccomp_wait_event(KleeInterceptor *self, KleeEvent *out)
 
     out->type = KLEE_EVENT_SYSCALL_ENTER;
     out->pid = notif->pid;
-    out->syscall_nr = notif->data.nr;
+    out->raw_nr = notif->data.nr;
+    if (notif->data.arch == AUDIT_ARCH_I386) {
+        out->abi = KLEE_ABI_I386;
+        out->syscall_nr = klee_sysnum_i386_to_x64(notif->data.nr, &out->abi_flags);
+    } else {
+        out->abi = KLEE_ABI_X86_64;
+        out->abi_flags = 0;
+        out->syscall_nr = notif->data.nr;
+    }
     out->notif_id = notif->id;
     for (int i = 0; i < 6; i++)
         out->args[i] = notif->data.args[i];

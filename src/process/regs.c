@@ -14,11 +14,10 @@
 int klee_regs_fetch(KleeInterceptor *ic, KleeProcess *proc)
 {
     if (ic->backend == INTERCEPT_PTRACE) {
-        struct iovec iov = {
-            &proc->regs[REG_CURRENT],
-            sizeof(struct user_regs_struct)
-        };
-        if (ptrace(PTRACE_GETREGSET, proc->real_pid, NT_PRSTATUS, &iov) < 0)
+        /* PTRACE_GETREGS: the 64-bit register view for every tracee.
+         * GETREGSET would return the i386 layout for a 32-bit one. */
+        if (ptrace(PTRACE_GETREGS, proc->real_pid, NULL,
+                   &proc->regs[REG_CURRENT]) < 0)
             return -errno;
     }
     /* For seccomp_unotify, registers come from the notification struct */
@@ -28,11 +27,8 @@ int klee_regs_fetch(KleeInterceptor *ic, KleeProcess *proc)
 int klee_regs_push(KleeInterceptor *ic, KleeProcess *proc)
 {
     if (ic->backend == INTERCEPT_PTRACE) {
-        struct iovec iov = {
-            &proc->regs[REG_CURRENT],
-            sizeof(struct user_regs_struct)
-        };
-        if (ptrace(PTRACE_SETREGSET, proc->real_pid, NT_PRSTATUS, &iov) < 0)
+        if (ptrace(PTRACE_SETREGS, proc->real_pid, NULL,
+                   &proc->regs[REG_CURRENT]) < 0)
             return -errno;
     }
     return 0;
@@ -50,11 +46,61 @@ void klee_regs_restore_original(KleeProcess *proc)
            sizeof(struct user_regs_struct));
 }
 
-/* x86_64 register mapping for syscall arguments:
- * arg0 = rdi, arg1 = rsi, arg2 = rdx, arg3 = r10, arg4 = r8, arg5 = r9
- * syscall number = orig_rax
- * return value = rax
+/* Register mapping for syscall arguments:
+ *   x86_64: arg0 = rdi, arg1 = rsi, arg2 = rdx, arg3 = r10, arg4 = r8, arg5 = r9
+ *   i386:   arg0 = ebx, arg1 = ecx, arg2 = edx, arg3 = esi, arg4 = edi, arg5 = ebp
+ * syscall number = orig_rax, return value = rax in both.
  */
+
+static uint64_t get_reg_arg(const KleeProcess *proc, int n)
+{
+    const struct user_regs_struct *r = &proc->regs[REG_CURRENT];
+    if (proc->abi == KLEE_ABI_I386) {
+        switch (n) {
+        case 0: return (uint32_t)r->rbx;
+        case 1: return (uint32_t)r->rcx;
+        case 2: return (uint32_t)r->rdx;
+        case 3: return (uint32_t)r->rsi;
+        case 4: return (uint32_t)r->rdi;
+        case 5: return (uint32_t)r->rbp;
+        default: return 0;
+        }
+    }
+    switch (n) {
+    case 0: return r->rdi;
+    case 1: return r->rsi;
+    case 2: return r->rdx;
+    case 3: return r->r10;
+    case 4: return r->r8;
+    case 5: return r->r9;
+    default: return 0;
+    }
+}
+
+static void set_reg_arg(KleeProcess *proc, int n, uint64_t value)
+{
+    struct user_regs_struct *r = &proc->regs[REG_CURRENT];
+    if (proc->abi == KLEE_ABI_I386) {
+        value = (uint32_t)value;
+        switch (n) {
+        case 0: r->rbx = value; break;
+        case 1: r->rcx = value; break;
+        case 2: r->rdx = value; break;
+        case 3: r->rsi = value; break;
+        case 4: r->rdi = value; break;
+        case 5: r->rbp = value; break;
+        }
+        return;
+    }
+    switch (n) {
+    case 0: r->rdi = value; break;
+    case 1: r->rsi = value; break;
+    case 2: r->rdx = value; break;
+    case 3: r->r10 = value; break;
+    case 4: r->r8 = value; break;
+    case 5: r->r9 = value; break;
+    }
+}
 
 int klee_regs_get_sysnum(const KleeProcess *proc)
 {
@@ -68,29 +114,28 @@ void klee_regs_set_sysnum(KleeProcess *proc, int sysnum)
 
 uint64_t klee_regs_get_arg(const KleeProcess *proc, int n)
 {
-    const struct user_regs_struct *r = &proc->regs[REG_CURRENT];
-    switch (n) {
-    case 0: return r->rdi;
-    case 1: return r->rsi;
-    case 2: return r->rdx;
-    case 3: return r->r10;
-    case 4: return r->r8;
-    case 5: return r->r9;
-    default: return 0;
-    }
+    if (n < 0 || n > 5)
+        return 0;
+    if (proc->demux_mem)
+        return proc->demux_args[n];
+    return get_reg_arg(proc, n + proc->arg_shift);
 }
 
 void klee_regs_set_arg(KleeProcess *proc, int n, uint64_t value)
 {
-    struct user_regs_struct *r = &proc->regs[REG_CURRENT];
-    switch (n) {
-    case 0: r->rdi = value; break;
-    case 1: r->rsi = value; break;
-    case 2: r->rdx = value; break;
-    case 3: r->r10 = value; break;
-    case 4: r->r8 = value; break;
-    case 5: r->r9 = value; break;
+    if (n < 0 || n > 5)
+        return;
+    if (proc->demux_mem) {
+        proc->demux_args[n] = value;
+        proc->demux_dirty = true;
+        return;
     }
+    set_reg_arg(proc, n + proc->arg_shift, value);
+}
+
+void klee_regs_set_arg_raw(KleeProcess *proc, int n, uint64_t value)
+{
+    set_reg_arg(proc, n, value);
 }
 
 long klee_regs_get_result(const KleeProcess *proc)
@@ -110,5 +155,7 @@ uint64_t klee_regs_get_ip(const KleeProcess *proc)
 
 uint64_t klee_regs_get_sp(const KleeProcess *proc)
 {
+    if (proc->abi == KLEE_ABI_I386)
+        return (uint32_t)proc->regs[REG_CURRENT].rsp;
     return proc->regs[REG_CURRENT].rsp;
 }

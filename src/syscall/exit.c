@@ -4,6 +4,8 @@
  */
 #include "syscall/exit.h"
 #include "syscall/sysnum.h"
+#include "syscall/sysnum32.h"
+#include "syscall/abi.h"
 #include "process/memory.h"
 #include "process/regs.h"
 #include "fs/fd_table.h"
@@ -65,43 +67,58 @@ int klee_exit_stat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     if (!proc->sandbox || !proc->sandbox->unshare_user || !proc->id_state)
         return 0;
 
+    /* The legacy i386 stat/oldstat buffers have 16-bit ids at other
+     * offsets; nothing modern issues them, leave them alone. */
+    if (proc->sys32_flags & KLEE_SYS32_OLDSTRUCT)
+        return 0;
+
     /* Rewrite uid/gid in stat buffer.
      * stat/lstat/fstat: statbuf is args[1]
      * newfstatat:       statbuf is args[2] (dirfd, path, statbuf, flags) */
-    void *stat_addr;
+    uint64_t stat_addr;
 #ifdef KLEE_SYS_newfstatat
     if (ev->syscall_nr == KLEE_SYS_newfstatat)
-        stat_addr = (void *)(uintptr_t)ev->args[2];
+        stat_addr = ev->args[2];
     else
 #endif
-        stat_addr = (void *)(uintptr_t)ev->args[1];
+        stat_addr = ev->args[1];
 
-    struct stat st;
-    int rc = klee_read_mem(ic, ev->pid, &st, stat_addr, sizeof(st));
-    if (rc < 0)
+    /* Only the fields klee may change, at the offsets of the tracee's
+     * struct (struct stat on x86_64, struct stat64 for a 32-bit tracee). */
+    size_t mode_off, uid_off, gid_off;
+    klee_abi_stat_layout(proc->abi, &mode_off, &uid_off, &gid_off);
+
+    uint32_t mode, uid, gid;
+    if (klee_read_mem(ic, ev->pid, &mode, (void *)(uintptr_t)(stat_addr + mode_off), sizeof(mode)) < 0 ||
+        klee_read_mem(ic, ev->pid, &uid, (void *)(uintptr_t)(stat_addr + uid_off), sizeof(uid)) < 0 ||
+        klee_read_mem(ic, ev->pid, &gid, (void *)(uintptr_t)(stat_addr + gid_off), sizeof(gid)) < 0)
         return 0;
 
-    /* If the file is owned by us in reality, show it as owned by virtual uid */
-    uid_t real_uid = getuid();
-    gid_t real_gid = getgid();
+    uint32_t new_mode = mode, new_uid = uid, new_gid = gid;
 
-    if (st.st_uid == real_uid)
-        st.st_uid = proc->id_state->euid;
-    if (st.st_gid == real_gid)
-        st.st_gid = proc->id_state->egid;
+    /* If the file is owned by us in reality, show it as owned by virtual uid */
+    if (uid == (uint32_t)getuid())
+        new_uid = proc->id_state->euid;
+    if (gid == (uint32_t)getgid())
+        new_gid = proc->id_state->egid;
 
     /* Fake SUID ownership for chrome-sandbox when zypak is active.
      * Chrome stat()s the sandbox helper before exec and requires
      * root ownership + setuid bit. */
     if (proc->sandbox->zypak_detected &&
         klee_zypak_is_chrome_sandbox(proc->saved_path)) {
-        st.st_uid = 0;
-        st.st_mode |= S_ISUID | S_IXUSR | S_IXGRP | S_IXOTH;
+        new_uid = 0;
+        new_mode |= S_ISUID | S_IXUSR | S_IXGRP | S_IXOTH;
         KLEE_DEBUG("stat: faked SUID for chrome-sandbox: %s",
                    proc->saved_path);
     }
 
-    ic->write_mem(ic, ev->pid, stat_addr, &st, sizeof(st));
+    if (new_mode != mode)
+        ic->write_mem(ic, ev->pid, (void *)(uintptr_t)(stat_addr + mode_off), &new_mode, sizeof(new_mode));
+    if (new_uid != uid)
+        ic->write_mem(ic, ev->pid, (void *)(uintptr_t)(stat_addr + uid_off), &new_uid, sizeof(new_uid));
+    if (new_gid != gid)
+        ic->write_mem(ic, ev->pid, (void *)(uintptr_t)(stat_addr + gid_off), &new_gid, sizeof(new_gid));
     return 0;
 }
 
@@ -656,6 +673,8 @@ int klee_exit_getgroups(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 
 int klee_exit_uname(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
+    if (proc->sys32_flags & KLEE_SYS32_OLDSTRUCT)
+        return 0;   /* oldolduname: 9-byte fields, leave it alone */
     if (ev->retval < 0)
         return 0;
     if (!proc->sandbox || !proc->sandbox->unshare_uts || !proc->sandbox->hostname)
@@ -806,75 +825,67 @@ int klee_exit_recvmsg(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
         return 0;
 
     /* recvmsg(int sockfd, struct msghdr *msg, int flags) */
-    void *msg_addr = (void *)(uintptr_t)ev->args[1];
-    if (!msg_addr)
+    if (!ev->args[1])
         return 0;
 
-    struct msghdr msg;
-    int rc = klee_read_mem(ic, ev->pid, &msg, msg_addr, sizeof(msg));
-    if (rc < 0)
+    uint64_t ctrl_addr = 0;
+    size_t ctrllen = 0;
+    if (klee_abi_read_msg_control(ic, ev->pid, proc->abi, ev->args[1],
+                                  &ctrl_addr, &ctrllen) < 0)
+        return 0;
+    if (!ctrl_addr || ctrllen == 0 || ctrllen > 4096)
         return 0;
 
-    if (!msg.msg_control || msg.msg_controllen == 0)
-        return 0;
-
-    size_t ctrllen = msg.msg_controllen;
-    if (ctrllen > 4096)
-        return 0;
-
-    char ctrl_buf[4096];
-    void *ctrl_addr = msg.msg_control;
-    rc = klee_read_mem(ic, ev->pid, ctrl_buf, ctrl_addr, ctrllen);
+    uint8_t ctrl_buf[4096];
+    int rc = klee_read_mem(ic, ev->pid, ctrl_buf,
+                           (const void *)(uintptr_t)ctrl_addr, ctrllen);
     if (rc < 0)
         return 0;
 
     bool modified = false;
-    struct msghdr local_msg;
-    memset(&local_msg, 0, sizeof(local_msg));
-    local_msg.msg_control = ctrl_buf;
-    local_msg.msg_controllen = ctrllen;
-
     uid_t real_uid = getuid();
     gid_t real_gid = getgid();
 
-    for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&local_msg);
-         cmsg != NULL;
-         cmsg = CMSG_NXTHDR(&local_msg, cmsg)) {
-        if (cmsg->cmsg_level == SOL_SOCKET &&
-            cmsg->cmsg_type == SCM_CREDENTIALS &&
-            cmsg->cmsg_len >= CMSG_LEN(sizeof(struct ucred))) {
-            struct ucred *cred = (struct ucred *)CMSG_DATA(cmsg);
+    size_t off = 0, data_off, data_len;
+    int level, type;
+    while (klee_abi_cmsg_next(proc->abi, ctrl_buf, ctrllen, &off,
+                              &level, &type, &data_off, &data_len)) {
+        if (level != SOL_SOCKET || type != SCM_CREDENTIALS ||
+            data_len < sizeof(struct ucred))
+            continue;
+        struct ucred cred;
+        memcpy(&cred, ctrl_buf + data_off, sizeof(cred));
+        if (cred.uid != real_uid && cred.gid != real_gid)
+            continue;
 
-            if (cred->uid == real_uid || cred->gid == real_gid) {
-                KLEE_TRACE("recvmsg SCM_CREDENTIALS: pid=%d uid=%d gid=%d -> "
-                           "uid=%d gid=%d",
-                           cred->pid, cred->uid, cred->gid,
-                           proc->id_state->euid, proc->id_state->egid);
+        KLEE_TRACE("recvmsg SCM_CREDENTIALS: pid=%d uid=%d gid=%d -> "
+                   "uid=%d gid=%d",
+                   cred.pid, cred.uid, cred.gid,
+                   proc->id_state->euid, proc->id_state->egid);
 
-                if (cred->uid == real_uid)
-                    cred->uid = proc->id_state->euid;
-                if (cred->gid == real_gid)
-                    cred->gid = proc->id_state->egid;
+        if (cred.uid == real_uid)
+            cred.uid = proc->id_state->euid;
+        if (cred.gid == real_gid)
+            cred.gid = proc->id_state->egid;
 
-                /* Translate PID if PID namespace is active */
-                if (proc->sandbox->unshare_pid && proc->sandbox->pid_map) {
-                    pid_t vpid = klee_pid_map_r2v(proc->sandbox->pid_map,
-                                                   cred->pid);
-                    if (vpid > 0)
-                        cred->pid = vpid;
-                    else if (cred->pid > 0)
-                        cred->pid = 0;
-                }
-
-                modified = true;
-            }
+        /* Translate PID if PID namespace is active */
+        if (proc->sandbox->unshare_pid && proc->sandbox->pid_map) {
+            pid_t vpid = klee_pid_map_r2v(proc->sandbox->pid_map, cred.pid);
+            if (vpid > 0)
+                cred.pid = vpid;
+            else if (cred.pid > 0)
+                cred.pid = 0;
         }
+
+        memcpy(ctrl_buf + data_off, &cred, sizeof(cred));
+        modified = true;
     }
 
     if (!modified)
         return 0;
 
-    rc = klee_write_mem(ic, ev->pid, ctrl_addr, ctrl_buf, ctrllen);
+    rc = klee_write_mem(ic, ev->pid, (void *)(uintptr_t)ctrl_addr, ctrl_buf,
+                        ctrllen);
     if (rc < 0)
         KLEE_DEBUG("recvmsg: failed to write back SCM_CREDENTIALS: %d", rc);
 

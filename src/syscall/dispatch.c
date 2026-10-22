@@ -160,6 +160,49 @@ void klee_dispatch_init(void)
     register_handler(KLEE_SYS_getsockopt,"getsockopt", NULL, klee_exit_getsockopt);
     register_handler(KLEE_SYS_inotify_add_watch, "inotify_add_watch",
                      klee_enter_inotify_add_watch, NULL);
+    register_handler(KLEE_SYS_utimensat, "utimensat", klee_enter_utimensat, NULL);
+    register_handler(KLEE_SYS_utimes,    "utimes",    klee_enter_utimes, NULL);
+    register_handler(KLEE_SYS_utime,     "utime",     klee_enter_utimes, NULL);
+    register_handler(KLEE_SYS_futimesat, "futimesat", klee_enter_futimesat, NULL);
+    register_handler(KLEE_SYS_setxattr,  "setxattr",  klee_enter_xattr_write, NULL);
+    register_handler(KLEE_SYS_lsetxattr, "lsetxattr", klee_enter_lxattr_write, NULL);
+    register_handler(KLEE_SYS_removexattr, "removexattr", klee_enter_xattr_write, NULL);
+    register_handler(KLEE_SYS_lremovexattr, "lremovexattr", klee_enter_lxattr_write, NULL);
+    register_handler(KLEE_SYS_getxattr,  "getxattr",  klee_enter_xattr_read, NULL);
+    register_handler(KLEE_SYS_lgetxattr, "lgetxattr", klee_enter_lxattr_read, NULL);
+    register_handler(KLEE_SYS_listxattr, "listxattr", klee_enter_xattr_read, NULL);
+    register_handler(KLEE_SYS_llistxattr, "llistxattr", klee_enter_lxattr_read, NULL);
+    register_handler(KLEE_SYS_statfs,    "statfs",    klee_enter_statfs, NULL);
+    register_handler(KLEE_SYS_fchmodat2, "fchmodat2", klee_enter_fchmodat2, NULL);
+    register_handler(KLEE_SYS_fanotify_mark, "fanotify_mark", klee_enter_fanotify_mark, NULL);
+    register_handler(KLEE_SYS_name_to_handle_at, "name_to_handle_at", klee_enter_name_to_handle_at, NULL);
+    register_handler(KLEE_SYS_open_tree, "open_tree", klee_enter_open_tree, NULL);
+    register_handler(KLEE_SYS_sched_setaffinity, "sched_setaffinity", klee_enter_pid_arg0, NULL);
+    register_handler(KLEE_SYS_sched_getaffinity, "sched_getaffinity", klee_enter_pid_arg0, NULL);
+    register_handler(KLEE_SYS_sched_setscheduler, "sched_setscheduler", klee_enter_pid_arg0, NULL);
+    register_handler(KLEE_SYS_sched_getscheduler, "sched_getscheduler", klee_enter_pid_arg0, NULL);
+    register_handler(KLEE_SYS_sched_setparam, "sched_setparam", klee_enter_pid_arg0, NULL);
+    register_handler(KLEE_SYS_sched_getparam, "sched_getparam", klee_enter_pid_arg0, NULL);
+    register_handler(KLEE_SYS_sched_rr_get_interval, "sched_rr_get_interval", klee_enter_pid_arg0, NULL);
+    register_handler(KLEE_SYS_sched_setattr, "sched_setattr", klee_enter_pid_arg0, NULL);
+    register_handler(KLEE_SYS_sched_getattr, "sched_getattr", klee_enter_pid_arg0, NULL);
+    register_handler(KLEE_SYS_prlimit64, "prlimit64", klee_enter_pid_arg0, NULL);
+    register_handler(KLEE_SYS_process_vm_readv, "process_vm_readv", klee_enter_pid_arg0, NULL);
+    register_handler(KLEE_SYS_process_vm_writev, "process_vm_writev", klee_enter_pid_arg0, NULL);
+    register_handler(KLEE_SYS_get_robust_list, "get_robust_list", klee_enter_pid_arg0, NULL);
+    register_handler(KLEE_SYS_move_pages, "move_pages", klee_enter_pid_arg0, NULL);
+    register_handler(KLEE_SYS_migrate_pages, "migrate_pages", klee_enter_pid_arg0, NULL);
+    register_handler(KLEE_SYS_kcmp, "kcmp", klee_enter_kcmp, NULL);
+    register_handler(KLEE_SYS_perf_event_open, "perf_event_open", klee_enter_perf_event_open, NULL);
+    register_handler(KLEE_SYS_setpriority, "setpriority", klee_enter_prio, NULL);
+    register_handler(KLEE_SYS_getpriority, "getpriority", klee_enter_prio, NULL);
+    register_handler(KLEE_SYS_ioprio_set, "ioprio_set", klee_enter_ioprio, NULL);
+    register_handler(KLEE_SYS_ioprio_get, "ioprio_get", klee_enter_ioprio, NULL);
+    register_handler(KLEE_SYS_clone,     "clone",     klee_enter_clone, NULL);
+#ifdef KLEE_SYS_clone3
+    register_handler(KLEE_SYS_clone3,    "clone3",    klee_enter_clone3, NULL);
+#endif
+    register_handler(KLEE_SYS_unshare,   "unshare",   klee_enter_unshare, NULL);
 
 #ifdef KLEE_SYS_io_uring_setup
     register_handler(KLEE_SYS_io_uring_setup, "io_uring_setup",

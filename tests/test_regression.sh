@@ -20,6 +20,13 @@
 #  13. --unshare-pid: orphans adopted by init, init's parent reads 0
 #  14. Processes outliving the main command die with klee
 #  15. Processes keep their own name under identity mounts (no ld.so hop)
+#  16. --ro-bind follows the kernel's rules: device nodes stay writable
+#  17. Process identity (comm, cmdline, argv[0]) with a sandbox-private ld.so
+#  18. 32-bit (i386) tracees are interposed like 64-bit ones
+#  19. utimensat/xattr/statfs & co. are translated and honour read-only mounts
+#  20. --unshare-pid: one consistent PID numbering, host PIDs out of reach
+#  21. Threads share the virtual cwd and fd table (CLONE_FS/CLONE_FILES)
+#  22. execveat/fexecve and /proc/self/fd/N execs get the sandbox's loader
 set -e
 
 KLEE="${KLEE:-./klee}"
@@ -594,6 +601,332 @@ if [ "$comm" = "cat" ]; then
     pass "comm is the program, not ld-linux"
 else
     fail "comm under --bind / / (got: $comm)"
+fi
+
+# ---------------------------------------------------------------------------
+# Fix 16: read-only mounts follow the kernel's rules for what needs write
+# access.  klee refused every write-mode open under --ro-bind, but a real
+# MS_RDONLY mount still lets you write to device nodes, fifos and sockets,
+# reopen an existing file with O_CREAT, and gives ENOENT/EISDIR where no
+# write would ever happen.  echo > /dev/null under --ro-bind / / failed.
+# ---------------------------------------------------------------------------
+echo "--- Read-only mounts: device nodes and existing-file opens ---"
+out=$($KLEE --ro-bind / / -- /bin/sh -c 'echo hi > /dev/null && echo devnull-ok' 2>/dev/null || true)
+if [ "$out" = "devnull-ok" ]; then
+    pass "write to /dev/null under --ro-bind / /"
+else
+    fail "write to /dev/null under --ro-bind / / (got: $out)"
+fi
+if command -v python3 >/dev/null 2>&1; then
+    out=$($KLEE --ro-bind / / -- python3 -c '
+import os, errno
+def t(fn):
+    try:
+        fn(); return "ok"
+    except OSError as e:
+        return errno.errorcode[e.errno]
+print(t(lambda: os.close(os.open("/etc/passwd", os.O_RDONLY | os.O_CREAT, 0o644))),
+      t(lambda: os.open("/etc/passwd", os.O_WRONLY)),
+      t(lambda: os.open("/etc/klee-ro-missing", os.O_WRONLY)),
+      t(lambda: os.open("/etc/klee-ro-missing", os.O_WRONLY | os.O_CREAT, 0o644)),
+      t(lambda: os.open("/etc", os.O_WRONLY)),
+      t(lambda: os.open("/etc", os.O_TMPFILE | os.O_WRONLY, 0o644)))
+' 2>/dev/null || true)
+    if [ "$out" = "ok EROFS ENOENT EROFS EISDIR EROFS" ]; then
+        pass "ro-bind open() results match a real read-only mount"
+    else
+        fail "ro-bind open() results (got: $out)"
+    fi
+else
+    echo "  SKIP: python3 not available (ro-bind open semantics)"
+fi
+
+# ---------------------------------------------------------------------------
+# Fix 17: process identity when the sandbox has its own ld.so.  The kernel
+# resolves PT_INTERP on the host, so klee ran every dynamic binary from a
+# Conty/Steam-runtime style rootfs as "ld.so <program>": comm became
+# ld-linux-x86-64, cmdline grew the loader, argv[0] turned into the resolved
+# path, and ps/pgrep/pidof/killall could not find anything by name.  Such
+# binaries now run as private copies whose PT_INTERP names the sandbox's
+# loader (src/syscall/exec_shim.c).
+#
+# The rootfs here is the host's /usr and /etc plus a *copy* of the host's
+# loader at /lib64: same code, different file, so the rewrite must happen.
+# ---------------------------------------------------------------------------
+echo "--- Process identity with a sandbox-private ld.so ---"
+LOADER=/lib64/ld-linux-x86-64.so.2
+if [ -e "$LOADER" ] && command -v python3 >/dev/null 2>&1; then
+    R=$(mktemp -d /tmp/klee-test-rootfs.XXXXXX)
+    mkdir -p "$R/lib64"
+    cp -L "$LOADER" "$R/lib64/"
+    ln -s usr/bin "$R/bin"
+    ln -s usr/lib "$R/lib"
+    printf '#!/bin/sh\ncat /proc/$$/comm\n' > "$R/script.sh"
+    chmod +x "$R/script.sh"
+    KARGS="--bind $R / --ro-bind /usr /usr --ro-bind /etc /etc --proc /proc --dev /dev"
+    before=$(ls -d /tmp/klee-exec.* /tmp/kl-?????? 2>/dev/null | wc -l)
+
+    out=$($KLEE $KARGS -- /usr/bin/python3 -c 'import os; os.execv("/bin/cat", ["custom-argv0", "/proc/self/comm", "/proc/self/cmdline"])' 2>/dev/null | tr "\0" " " || true)
+    if [ "$out" = "cat
+custom-argv0 /proc/self/comm /proc/self/cmdline " ]; then
+        pass "comm, cmdline and argv[0] are the program's own"
+    else
+        fail "process identity with private ld.so (got: $(printf '%s' "$out" | tr '\n' '|'))"
+    fi
+
+    out=$($KLEE $KARGS -- /script.sh 2>/dev/null || true)
+    if [ "$out" = "script.sh" ]; then
+        pass "a script's comm is the script's name"
+    else
+        fail "script comm with private ld.so (got: $out)"
+    fi
+
+    # Seen from the host while it runs: ps/pgrep find the program, not ld.so
+    marker="2.$(( 700000 + $$ % 100000 ))"
+    $KLEE $KARGS -- /bin/sleep "$marker" >/dev/null 2>&1 &
+    kpid=$!
+    sleep 1
+    spid=$(pgrep -f "^/bin/sleep $marker\$" | head -1)
+    scomm=$( [ -n "$spid" ] && cat "/proc/$spid/comm" 2>/dev/null )
+    if [ "$scomm" = "sleep" ]; then
+        pass "host ps/pgrep see the program by name"
+    else
+        fail "host view of a sandbox process (pid=$spid comm=$scomm)"
+    fi
+    wait $kpid 2>/dev/null || true
+
+    after=$(ls -d /tmp/klee-exec.* /tmp/kl-?????? 2>/dev/null | wc -l)
+    if [ "$after" -le "$before" ]; then
+        pass "session directories removed on exit"
+    else
+        fail "session directories left behind ($before -> $after)"
+    fi
+
+    # Without copies klee runs ld.so itself; comm must still be the program's
+    out=$(KLEE_EXEC_SHIM=0 $KLEE $KARGS -- /bin/cat /proc/self/comm 2>/dev/null || true)
+    if [ "$out" = "cat" ]; then
+        pass "ld.so fallback keeps comm"
+    else
+        fail "ld.so fallback comm (got: $out)"
+    fi
+
+    rm -rf "$R"
+else
+    echo "  SKIP: $LOADER or python3 not available (process identity)"
+fi
+
+# ---------------------------------------------------------------------------
+# Fix 18: 32-bit tracees.  klee's seccomp filter only trapped the x86_64
+# ABI and the backend only decoded x86_64 registers, so a 32-bit program
+# (the Steam client, 32-bit games) ran with no path, pid or uid translation
+# at all.  tests/klee32.s is a freestanding i386 program issuing raw
+# int $0x80 syscalls, so no 32-bit libc or loader is needed on the host.
+# ---------------------------------------------------------------------------
+echo "--- 32-bit (i386) tracees: paths, pids, uids, EROFS, socketcall, exec ---"
+LOADER=/lib64/ld-linux-x86-64.so.2
+if [ -e "$LOADER" ] && command -v as >/dev/null 2>&1 && command -v ld >/dev/null 2>&1; then
+    R=$(mktemp -d /tmp/klee-test-i386.XXXXXX)
+    if as --32 -o "$R/klee32.o" tests/klee32.s 2>/dev/null &&
+       ld -m elf_i386 -static -o "$R/klee32" "$R/klee32.o" 2>/dev/null; then
+        mkdir -p "$R/lib64" "$R/tmp"
+        cp -L "$LOADER" "$R/lib64/"
+        ln -s usr/bin "$R/bin"
+        ln -s usr/lib "$R/lib"
+        echo hi > "$R/guest-file"
+        KARGS="--bind $R / --ro-bind /usr /usr --ro-bind /etc /etc --proc /proc --dev /dev"
+        expected=$(printf 'T1=hi\nT2=00000001\nT3=00001092\nT4=ffffffe2\nT5=00000000\nT6=/klee32\nT7=00001092\nexec-ok\nsh')
+        out=$($KLEE $KARGS --unshare-pid --unshare-user --uid 4242 --gid 4242 -- /klee32 2>/dev/null || true)
+        if [ "$out" = "$expected" ]; then
+            pass "i386 syscalls translated (open/stat64/getpid/getuid32/socketcall/execve)"
+        else
+            fail "i386 syscalls (got: $(printf '%s' "$out" | tr '\n' '|'))"
+        fi
+        if [ -S "$R/tmp/klee32.sock" ]; then
+            pass "socketcall(SYS_BIND) path translated into the rootfs"
+        else
+            fail "socketcall(SYS_BIND) path translation"
+        fi
+        rm -f "$R/tmp/klee32.sock"
+        out=$(KLEE_EXEC_SHIM=0 $KLEE $KARGS -- /klee32 2>/dev/null | tail -2 | tr '\n' ' ' || true)
+        if [ "$out" = "exec-ok sh " ]; then
+            pass "ld.so fallback rebuilds argv with 4-byte pointers"
+        else
+            fail "ld.so fallback from a 32-bit caller (got: $out)"
+        fi
+        rm -f /usr/klee-32-erofs   # only exists if the EROFS check failed
+    else
+        echo "  SKIP: cannot assemble a 32-bit test binary"
+    fi
+    rm -rf "$R"
+else
+    echo "  SKIP: no x86_64 loader or binutils (32-bit tracee test)"
+fi
+
+# ---------------------------------------------------------------------------
+# Fix 19: path syscalls that were never intercepted (utimensat, utimes,
+# utime, futimesat, *xattr, statfs, fchmodat2, fanotify_mark,
+# name_to_handle_at, open_tree) went to the host filesystem untranslated:
+# utime() on a guest path changed the host file of the same name, statfs and
+# getxattr got ENOENT, and none of them honoured --ro-bind.  chown/lchown/
+# fchownat also skipped the read-only check.
+# ---------------------------------------------------------------------------
+echo "--- Timestamps, xattrs and statfs follow the mount table ---"
+if command -v python3 >/dev/null 2>&1 && [ -e /lib64/ld-linux-x86-64.so.2 ]; then
+    R=$(mktemp -d /tmp/klee-test-paths.XXXXXX)
+    mkdir -p "$R/lib64" "$R/tmp"
+    cp -L /lib64/ld-linux-x86-64.so.2 "$R/lib64/"
+    ln -s usr/bin "$R/bin"
+    ln -s usr/lib "$R/lib"
+    echo hi > "$R/guest-file"
+    HV=$(mktemp /tmp/klee-test-victim.XXXXXX)
+    touch -d '2001-01-01' "$HV" "$R$HV"
+    out=$($KLEE --bind "$R" / --ro-bind /usr /usr --ro-bind /etc /etc --proc /proc --dev /dev \
+          -- /usr/bin/python3 -c "
+import os, errno
+def t(fn):
+    try: fn(); return 'ok'
+    except OSError as e: return errno.errorcode[e.errno]
+print(t(lambda: os.utime('$HV', (1000000000, 1000000000))),
+      t(lambda: os.statvfs('/guest-file')),
+      t(lambda: os.getxattr('/guest-file', 'user.nope')),
+      t(lambda: os.utime('/usr/bin/true', None)),
+      t(lambda: os.setxattr('/usr/bin/true', 'user.k', b'v')),
+      t(lambda: os.chown('/usr/bin/true', 0, 0)))" 2>/dev/null || true)
+    hmt=$(stat -c %Y "$HV"); gmt=$(stat -c %Y "$R$HV")
+    rm -rf "$R" "$HV"
+    if [ "$out" = "ok ok ENODATA EROFS EROFS EROFS" ] && [ "$hmt" != "1000000000" ] && [ "$gmt" = "1000000000" ]; then
+        pass "utime/statfs/xattr translated; read-only mounts enforced"
+    else
+        fail "path syscalls (got: $out host-mtime=$hmt guest-mtime=$gmt)"
+    fi
+else
+    echo "  SKIP: python3 or x86_64 loader not available (path syscalls)"
+fi
+
+# ---------------------------------------------------------------------------
+# Fix 20: --unshare-pid numbering.  fork() returned the host PID while the
+# child's getpid() returned a small virtual one, so pidfiles, wait() results
+# and SIGCHLD disagreed with the child's own view.  Now init is 1 and every
+# other process keeps its host number everywhere, including si_pid.  PIDs of
+# host processes stay out of reach: sched_*, setpriority, prlimit and
+# /proc/<pid> see them as nonexistent, as in a real PID namespace.
+# ---------------------------------------------------------------------------
+echo "--- --unshare-pid: consistent PIDs, host PIDs unreachable ---"
+if command -v python3 >/dev/null 2>&1; then
+    out=$($KLEE --bind / / --unshare-pid --setenv HOSTPID $$ -- python3 -c '
+import os, signal, time, errno, resource
+signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGCHLD, signal.SIGUSR1])
+r, w = os.pipe()
+p = os.fork()
+if p == 0:
+    os.write(w, str(os.getpid()).encode()); os.kill(os.getppid(), signal.SIGUSR1); os._exit(0)
+cv = int(os.read(r, 32))
+u = signal.sigwaitinfo([signal.SIGUSR1]); c = signal.sigwaitinfo([signal.SIGCHLD])
+wp, _ = os.waitpid(-1, 0)
+same = p == cv == wp == c.si_pid == u.si_pid
+host = int(os.environ["HOSTPID"])
+def t(fn):
+    try: fn(); return "reached"
+    except OSError as e: return errno.errorcode[e.errno]
+print("same=%s init=%d ppid=%d" % (same, os.getpid(), os.getppid()),
+      t(lambda: os.sched_getaffinity(host)), t(lambda: os.setpriority(os.PRIO_PROCESS, host, 0)),
+      t(lambda: resource.prlimit(host, resource.RLIMIT_NOFILE)), t(lambda: open("/proc/%d/status" % host)),
+      "self=%s" % t(lambda: resource.prlimit(0, resource.RLIMIT_NOFILE)))' 2>/dev/null || true)
+    if [ "$out" = "same=True init=1 ppid=0 ESRCH ESRCH ESRCH ENOENT self=reached" ]; then
+        pass "fork/getpid/wait/si_pid agree; host PIDs are ESRCH/ENOENT"
+    else
+        fail "PID numbering/containment (got: $out)"
+    fi
+else
+    echo "  SKIP: python3 not available (PID numbering test)"
+fi
+
+# ---------------------------------------------------------------------------
+# Fix 21: threads.  Every clone got private copies of klee's virtual cwd
+# and fd table, so after one thread chdir()ed, a relative open in another
+# thread resolved against the stale directory (ENOENT), and a dirfd opened
+# by one thread was unknown to the others.  Clones now share both when
+# CLONE_FS/CLONE_FILES say so, and unshare() splits them again.
+# ---------------------------------------------------------------------------
+echo "--- Threads share cwd and fd table ---"
+if command -v python3 >/dev/null 2>&1 && [ -e /lib64/ld-linux-x86-64.so.2 ]; then
+    R=$(mktemp -d /tmp/klee-test-threads.XXXXXX)
+    mkdir -p "$R/lib64" "$R/d1" "$R/d2"
+    cp -L /lib64/ld-linux-x86-64.so.2 "$R/lib64/"
+    ln -s usr/bin "$R/bin"
+    ln -s usr/lib "$R/lib"
+    echo d1 > "$R/d1/f"
+    echo d2 > "$R/d2/f"
+    out=$($KLEE --bind "$R" / --ro-bind /usr /usr --ro-bind /etc /etc --proc /proc --dev /dev \
+          -- /usr/bin/python3 -c '
+import os, threading, errno, ctypes
+res = {}
+def a():
+    os.chdir("/d2"); res["dirfd"] = os.open("/d2", os.O_RDONLY)
+t = threading.Thread(target=a); t.start(); t.join()
+def b():
+    try: res["rel"] = open("f").read().strip()
+    except OSError as e: res["rel"] = errno.errorcode[e.errno]
+    try: res["at"] = os.read(os.open("f", os.O_RDONLY, dir_fd=res["dirfd"]), 10).decode().strip()
+    except OSError as e: res["at"] = errno.errorcode[e.errno]
+t = threading.Thread(target=b); t.start(); t.join()
+libc = ctypes.CDLL(None, use_errno=True)
+def c():
+    libc.unshare(0x200); os.chdir("/d1")      # CLONE_FS: private cwd from now on
+t = threading.Thread(target=c); t.start(); t.join()
+print(res["rel"], res["at"], os.getcwd())' 2>/dev/null || true)
+    rm -rf "$R"
+    if [ "$out" = "d2 d2 /d2" ]; then
+        pass "chdir and dirfds are shared between threads; unshare(CLONE_FS) splits"
+    else
+        fail "thread-shared cwd/fd table (got: $out)"
+    fi
+else
+    echo "  SKIP: python3 or x86_64 loader not available (threads test)"
+fi
+
+# ---------------------------------------------------------------------------
+# Fix 22: exec by descriptor.  execveat() and execs of /proc/self/fd/N
+# skipped the interpreter handling, so in a rootfs sandbox they ran the
+# program with the host's loader.  They now go through the same path as
+# execve, with the program reached through /proc/<pid>/fd/<fd>.
+# ---------------------------------------------------------------------------
+echo "--- execveat/fexecve use the sandbox's loader ---"
+if command -v python3 >/dev/null 2>&1 && [ -e /lib64/ld-linux-x86-64.so.2 ]; then
+    R=$(mktemp -d /tmp/klee-test-fexec.XXXXXX)
+    mkdir -p "$R/lib64"
+    cp -L /lib64/ld-linux-x86-64.so.2 "$R/lib64/"
+    ln -s usr/bin "$R/bin"
+    ln -s usr/lib "$R/lib"
+    out=$($KLEE --bind "$R" / --ro-bind /usr /usr --ro-bind /etc /etc --proc /proc --dev /dev \
+          -- /usr/bin/python3 -c '
+import os, ctypes
+cmd = "grep -m1 -o \"[^ ]*ld-linux[^ ]*\" /proc/self/maps"
+fd = os.open("/bin/sh", os.O_RDONLY)
+if os.fork() == 0:
+    os.execve("/proc/self/fd/%d" % fd, ["sh", "-c", cmd], {})
+os.wait()
+if os.fork() == 0:
+    d = os.open("/bin", os.O_RDONLY)
+    libc = ctypes.CDLL(None, use_errno=True)
+    argv = (ctypes.c_char_p * 4)(b"sh", b"-c", cmd.encode(), None)
+    libc.syscall(322, d, b"sh", argv, (ctypes.c_char_p * 1)(None), 0)   # execveat(dirfd, "sh")
+    os._exit(1)
+os.wait()
+os.execve(fd, ["sh", "-c", cmd], {})                                     # fexecve' 2>/dev/null | sort -u || true)
+    if [ "$out" = "/lib64/ld-linux-x86-64.so.2" ] || [ "$out" = "$R/lib64/ld-linux-x86-64.so.2" ]; then
+        # the maps show the host path of the loader actually mapped
+        if [ "$out" = "$R/lib64/ld-linux-x86-64.so.2" ]; then
+            pass "execve(/proc/self/fd), execveat(dirfd) and fexecve map the sandbox loader"
+        else
+            fail "exec by fd used the host loader"
+        fi
+    else
+        fail "exec by fd (got: $(printf '%s' "$out" | tr '\n' '|'))"
+    fi
+    rm -rf "$R"
+else
+    echo "  SKIP: python3 or x86_64 loader not available (exec by fd test)"
 fi
 
 echo ""
