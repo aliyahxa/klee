@@ -146,9 +146,23 @@ KleeProcess *klee_process_fork(KleeProcessTable *pt, KleeProcess *parent,
                                 pid_t child_real_pid,
                                 unsigned long clone_flags)
 {
+    /* FD table: shared with CLONE_FILES (threads), else a copy.  Obtain it
+     * before the child exists: if the copy runs out of memory the fork fails
+     * and nothing has changed, instead of a child running with no FD table. */
+    KleeFdTable *fd_table;
+    if (clone_flags & CLONE_FILES) {
+        fd_table = klee_fd_table_ref(parent->fd_table);
+    } else {
+        fd_table = klee_fd_table_clone(parent->fd_table);
+        if (!fd_table)
+            return NULL;
+    }
+
     KleeProcess *child = klee_process_create(pt, child_real_pid, parent->sandbox);
-    if (!child)
+    if (!child) {
+        klee_fd_table_destroy(fd_table);   /* drops the reference or the copy */
         return NULL;
+    }
 
     /* Copy state from parent */
     memcpy(child->vexe, parent->vexe, PATH_MAX);
@@ -164,12 +178,9 @@ KleeProcess *klee_process_fork(KleeProcessTable *pt, KleeProcess *parent,
     }
     child->vcwd = child->fs->cwd;
 
-    /* FD table: shared with CLONE_FILES (threads), else a copy */
+    /* Replace the empty FD table klee_process_create gave the child */
     klee_fd_table_destroy(child->fd_table);
-    if (clone_flags & CLONE_FILES)
-        child->fd_table = klee_fd_table_ref(parent->fd_table);
-    else
-        child->fd_table = klee_fd_table_clone(parent->fd_table);
+    child->fd_table = fd_table;
 
     /* Link into process tree */
     child->parent = parent;
