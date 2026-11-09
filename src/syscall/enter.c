@@ -237,6 +237,10 @@ static int translate_path_arg_ex(KleeProcess *proc, KleeInterceptor *ic,
     if (rc < 0) {
         KLEE_DEBUG("path resolution failed for %s: %d", proc->saved_path, rc);
         proc->resolved_guest[0] = '\0';
+        /* A symlink loop in the sandbox is one for the kernel too.  The raw
+         * path must not go through: on the host it names something else. */
+        if (rc == -ELOOP)
+            return rc;
         return 0;
     }
 
@@ -355,6 +359,16 @@ int klee_enter_openat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
     int flags = (int)ev->args[2];
     int rc = translate_path_arg_for(proc, ic, ev, 1, 0, open_nofollow(flags),
+                                    open_access(flags));
+    if (rc < 0) return rc;
+    return check_readonly_open(proc, flags);
+}
+
+int klee_enter_creat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    /* creat(path, mode) is open(path, O_CREAT | O_WRONLY | O_TRUNC, mode) */
+    int flags = O_CREAT | O_WRONLY | O_TRUNC;
+    int rc = translate_path_arg_for(proc, ic, ev, 0, -1, false,
                                     open_access(flags));
     if (rc < 0) return rc;
     return check_readonly_open(proc, flags);
