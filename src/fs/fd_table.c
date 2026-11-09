@@ -166,17 +166,20 @@ void klee_fd_table_remove(KleeFdTable *ft, int fd)
 
 int klee_fd_table_dup(KleeFdTable *ft, int old_fd, int new_fd, bool cloexec)
 {
-    const char *path = klee_fd_table_get(ft, old_fd);
-    if (!path)
-        return 0; /* Not tracked, OK */
-
-    /* dup2(fd, fd) changes nothing (the kernel keeps FD_CLOEXEC too).  Removing
-     * new_fd here would free the entry that path points into. */
+    /* dup2(fd, fd) changes nothing (the kernel keeps FD_CLOEXEC too).  Going
+     * on would free the entry that old_fd's path points into. */
     if (old_fd == new_fd)
         return 0;
 
-    /* Remove new_fd if it exists (dup2 semantics) */
-    klee_fd_table_remove(ft, new_fd);
+    const char *path = klee_fd_table_get(ft, old_fd);
+    if (!path) {
+        /* new_fd now refers to a file klee does not track: forget the path
+         * it had, or *at() calls on it would resolve against that one. */
+        klee_fd_table_remove(ft, new_fd);
+        return 0;
+    }
+
+    /* old_fd != new_fd, so updating new_fd's entry leaves path intact */
     return klee_fd_table_set(ft, new_fd, path, cloexec);
 }
 

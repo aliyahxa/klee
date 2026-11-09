@@ -79,11 +79,21 @@ KleeProcess *klee_process_create(KleeProcessTable *pt, pid_t real_pid,
     proc->vcwd = proc->fs->cwd;
     strcpy(proc->vcwd, "/");
 
+    /* klee_ht_put returns NULL both for a new key and when the table could
+     * not grow, so look the entry up to know it went in. */
+    klee_ht_put(pt->by_pid, (uint64_t)real_pid, proc);
+    if (klee_ht_get(pt->by_pid, (uint64_t)real_pid) != proc) {
+        klee_arena_destroy(proc->event_arena);
+        klee_arena_destroy(proc->life_arena);
+        klee_fd_table_destroy(proc->fd_table);
+        free(proc->fs);
+        free(proc);
+        return NULL;
+    }
+    pt->count++;
+
     if (sandbox)
         klee_sandbox_ref(sandbox);
-
-    klee_ht_put(pt->by_pid, (uint64_t)real_pid, proc);
-    pt->count++;
 
     KLEE_DEBUG("created process pid=%d", real_pid);
     return proc;
